@@ -2,129 +2,96 @@
 Core monitoring logic for e-Consul slot checker.
 Run loop in a thread with start/stop; expose current status for the web UI.
 """
+from __future__ import annotations
+
 import base64
 import json
 import os
 import re
 import threading
 import time
-from datetime import datetime, date, time as dt_time, timedelta, timezone
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from dotenv import load_dotenv, dotenv_values, set_key
-from curl_cffi import requests as curl_requests
 
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ENV_PATH = os.path.join(_BASE_DIR, ".env")
+from curl_cffi import requests as curl_requests
+from dotenv import dotenv_values, load_dotenv, set_key
+
+# ---------------------------------------------------------------------------
+# Module constants
+# ---------------------------------------------------------------------------
+
+_BASE_DIR = Path(__file__).parent
+ENV_PATH = str(_BASE_DIR / ".env")
 load_dotenv(ENV_PATH)
 
-# Defaults (NYC passport queue; override via .env or web Settings)
-DEFAULT_INSTITUTION_CODE = "1000000514"
-DEFAULT_CONSUL_IPN_HASH = "90ed02ab516eecbe60b758139ec26d32498df7f83e02d89be5a5ff69afa46e4c"
-
-
-def _read_interval() -> int:
-    try:
-        return max(60, min(86400, int(os.getenv("INTERVAL", "300"))))
-    except ValueError:
-        return 300
-
-
-# Config (reloaded by reload_config() after .env changes)
-TOKEN = (os.getenv("TOKEN", "PASTE_JWT_TOKEN_HERE") or "").strip().strip("'\"")
-USER_AGENT = (os.getenv("USER_AGENT", "PASTE_USER_AGENT_HERE") or "").strip().strip("'\"")
-COOKIES = os.getenv("COOKIES", "")
-INSTITUTION_CODE = os.getenv("INSTITUTION_CODE", DEFAULT_INSTITUTION_CODE)
-CONSUL_IPN_HASH = os.getenv("CONSUL_IPN_HASH", DEFAULT_CONSUL_IPN_HASH)
-INTERVAL = _read_interval()
-SLOT_MINUTES = 10
-# How far ahead to expand weekly reception hours into concrete slot times (intersected with bookable days below)
-SLOT_HORIZON_DAYS = 365 * 10
-# Day is an "anchor" when the portal shows a full slot grid (enough reservations that day).
-HIGH_DAY_RESERVATIONS = 20
-# Fill zero-reservation days only between two consecutive anchors a<b if (b-a) is short (portal batch gap).
-MAX_GAP_ZERO_BRIDGE_DAYS = 15
-# Only treat a gap as a real “open wave” when enough zero days sit between busy anchors (weekends are ~3 zeros, span 5).
-MIN_ZERO_DAYS_MAJOR_BRIDGE = 7
 API_URL = "https://my.e-consul.gov.ua/external_reader"
 BOOKING_LINK = "https://e-consul.gov.ua/tasks/create/161374/161374001"
 
-# Last HTTP/connection error from external_reader (for UI / CLI diagnostics)
-_last_api_error: str | None = None
+DEFAULT_INSTITUTION_CODE = "1000000514"
+DEFAULT_CONSUL_IPN_HASH = "90ed02ab516eecbe60b758139ec26d32498df7f83e02d89be5a5ff69afa46e4c"
 
-UA_WEEKDAY = {
+# Ukrainian weekday names → Python weekday number (Mon=0)
+UA_WEEKDAY: dict[str, int] = {
     "понеділок": 0, "вівторок": 1, "середа": 2, "четвер": 3,
     "п'ятниця": 4, "пятниця": 4, "субота": 5, "неділя": 6,
 }
 
 
-def get_booking_window() -> tuple[date, date]:
-    """Inclusive date range from today through a long fixed horizon (slot expansion only; portal enforces real limits)."""
-    start = date.today()
-    end = start + timedelta(days=SLOT_HORIZON_DAYS)
-    return start, end
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
+@dataclass
+class Config:
+    """All runtime settings in one place. Reload via Config.from_env()."""
 
-def get_headers():
-    h = {
-        "User-Agent": USER_AGENT,
-        "Accept": "*/*",
-        "Accept-Language": "en-US",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Referer": "https://e-consul.gov.ua/",
-        "Content-Type": "application/json",
-        "token": TOKEN,
-        "Origin": "https://e-consul.gov.ua",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
-        "Priority": "u=4",
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
-        "TE": "trailers",
-    }
-    if COOKIES.strip():
-        h["Cookie"] = COOKIES.strip()
-    return h
+    token: str
+    user_agent: str
+    cookies: str
+    institution_code: str
+    consul_ipn_hash: str
+    interval: int
 
+    # Wave-detection heuristic tuning (rarely need changing)
+    slot_minutes: int = 10
+    high_day_reservations: int = 20      # min reservations to treat a day as an "anchor"
+    max_gap_zero_bridge_days: int = 15   # max calendar gap between two anchors to bridge
+    min_zero_days_major_bridge: int = 7  # min zero days in that gap to qualify as a wave
 
-def _api_post(method: str, filters: dict) -> dict | None:
-    global _last_api_error
-    _last_api_error = None
-    try:
-        r = curl_requests.post(
-            API_URL, headers=get_headers(), json={
-                "service": "e-queue-register",
-                "method": method,
-                "filters": filters,
-            },
-            timeout=15,
-            impersonate="firefox",
-        )
-        if r.status_code != 200:
-            body = r.text or ""
-            if r.status_code in (401, 403):
-                _last_api_error = _format_api_auth_error(method, r.status_code, body)
-            else:
-                snippet = body[:240].replace("\n", " ")
-                _last_api_error = f"{method}: HTTP {r.status_code} {snippet}"
-            return None
+    @classmethod
+    def from_env(cls) -> Config:
+        load_dotenv(ENV_PATH, override=True)
+
+        def _s(key: str, default: str = "") -> str:
+            return (os.getenv(key, default) or "").strip().strip("'\"")
+
         try:
-            return r.json()
-        except ValueError as e:
-            _last_api_error = f"{method}: invalid JSON ({e})"
-            return None
-    except curl_requests.RequestsError as e:
-        _last_api_error = f"{method}: {e}"
-        return None
+            interval = max(60, min(86400, int(os.getenv("INTERVAL", "300"))))
+        except ValueError:
+            interval = 300
+
+        return cls(
+            token=_s("TOKEN", "PASTE_JWT_TOKEN_HERE"),
+            user_agent=_s("USER_AGENT", "PASTE_USER_AGENT_HERE"),
+            cookies=_s("COOKIES"),
+            institution_code=_s("INSTITUTION_CODE", DEFAULT_INSTITUTION_CODE),
+            consul_ipn_hash=_s("CONSUL_IPN_HASH", DEFAULT_CONSUL_IPN_HASH),
+            interval=interval,
+        )
+
+    @property
+    def is_token_set(self) -> bool:
+        return bool(self.token) and not self.token.startswith("PASTE_")
 
 
-def get_last_api_error() -> str | None:
-    return _last_api_error
-
+# ---------------------------------------------------------------------------
+# JWT helpers (pure — no I/O, no global state)
+# ---------------------------------------------------------------------------
 
 def decode_jwt_payload(token: str) -> dict | None:
-    """Decode JWT payload (no signature verification). Returns None if invalid."""
+    """Decode JWT payload without signature verification. Returns None if malformed."""
     t = (token or "").strip().strip("'\"")
     if not t or t.startswith("PASTE_"):
         return None
@@ -136,50 +103,45 @@ def decode_jwt_payload(token: str) -> dict | None:
     if pad != 4:
         body += "=" * pad
     try:
-        raw = base64.urlsafe_b64decode(body.encode("ascii"))
-        return json.loads(raw.decode("utf-8"))
+        return json.loads(base64.urlsafe_b64decode(body.encode("ascii")).decode("utf-8"))
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
         return None
 
 
-def get_token_status() -> dict:
+def get_token_status(token: str) -> dict:
     """
-    Expiry from JWT `exp` (Unix seconds, UTC).
-    Keys: configured, expired, exp_unix, exp_utc_iso, exp_local_display, expires_in_human, issues, server_message_hint
+    Parse JWT `exp` claim and return a human-readable status dict.
+    Keys: configured, expired, exp_unix, exp_utc_iso, exp_local_display,
+          expires_in_human, issues.
     """
     out: dict = {
-        "configured": False,
-        "expired": False,
-        "exp_unix": None,
-        "exp_utc_iso": None,
-        "exp_local_display": None,
-        "expires_in_human": None,
-        "issues": None,
+        "configured": False, "expired": False,
+        "exp_unix": None, "exp_utc_iso": None,
+        "exp_local_display": None, "expires_in_human": None, "issues": None,
     }
-    tok = (TOKEN or "").strip().strip("'\"")
+    tok = (token or "").strip().strip("'\"")
     if not tok or tok.startswith("PASTE_"):
         out["issues"] = "No TOKEN configured — add one in Settings."
         return out
+
     payload = decode_jwt_payload(tok)
     if payload is None:
         out["configured"] = True
         out["issues"] = "TOKEN is not a readable JWT (cannot show expiry)."
         return out
+
     out["configured"] = True
-    exp = payload.get("exp")
-    if exp is None:
-        out["issues"] = "JWT has no exp claim."
-        return out
     try:
-        exp_i = int(exp)
-    except (TypeError, ValueError):
-        out["issues"] = "Invalid exp in JWT."
+        exp_i = int(payload["exp"])
+    except (KeyError, TypeError, ValueError):
+        out["issues"] = "JWT has no valid exp claim."
         return out
+
     out["exp_unix"] = exp_i
     exp_dt = datetime.fromtimestamp(exp_i, tz=timezone.utc)
     out["exp_utc_iso"] = exp_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-    local = exp_dt.astimezone()
-    out["exp_local_display"] = local.strftime("%Y-%m-%d %H:%M:%S %Z")
+    out["exp_local_display"] = exp_dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
     now_ts = time.time()
     out["expired"] = exp_i < now_ts
     if out["expired"]:
@@ -190,285 +152,423 @@ def get_token_status() -> dict:
         m, s = divmod(rem, 60)
         out["expires_in_human"] = f"{h}h {m}m" if h else f"{m}m {s}s"
         out["issues"] = f"Valid; expires in ~{out['expires_in_human']} ({out['exp_utc_iso']})."
+
     return out
 
 
-def _format_api_auth_error(method: str, status_code: int, body_text: str) -> str:
-    """Human-readable auth/API errors using response body + JWT expiry."""
-    server_msg = ""
-    try:
-        j = json.loads(body_text)
-        err = j.get("error") if isinstance(j.get("error"), dict) else None
-        if err and err.get("message"):
-            server_msg = str(err["message"]).strip()
-        elif isinstance(j.get("message"), str):
-            server_msg = j["message"].strip()
-    except (json.JSONDecodeError, TypeError):
-        pass
+# ---------------------------------------------------------------------------
+# HTTP client
+# ---------------------------------------------------------------------------
 
-    ts = get_token_status()
-    exp_line = ""
-    if ts.get("exp_utc_iso"):
-        if ts.get("expired"):
-            exp_line = f" JWT expiry: {ts['exp_utc_iso']} (already passed)."
-        else:
-            exp_line = f" JWT expiry: {ts['exp_utc_iso']} (~{ts.get('expires_in_human', '?')} left)."
-    elif ts.get("issues"):
-        exp_line = f" ({ts['issues']})"
+class ApiClient:
+    """Thin wrapper around the e-Consul external_reader API endpoint."""
 
-    if status_code == 401:
-        core = (
-            "Authentication failed (HTTP 401): the server rejected your TOKEN — usually expired or revoked."
-            f"{exp_line}"
-        )
-        if server_msg:
-            core += f' Portal message: "{server_msg}"'
-        core += " → Open e-consul in the browser, log in, copy a fresh `token` header in Settings."
-        return f"{method}: {core}"
+    def __init__(self, config: Config) -> None:
+        self._cfg = config
+        self.last_error: str | None = None
 
-    if status_code == 403:
-        core = (
-            f"Access denied (HTTP 403) — often Cloudflare or session mismatch.{exp_line}"
-        )
-        if server_msg:
-            core += f' Server: "{server_msg}"'
-        return f"{method}: {core}"
+    def _headers(self) -> dict[str, str]:
+        h: dict[str, str] = {
+            "User-Agent": self._cfg.user_agent,
+            "Accept": "*/*",
+            "Accept-Language": "en-US",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Referer": "https://e-consul.gov.ua/",
+            "Content-Type": "application/json",
+            "token": self._cfg.token,
+            "Origin": "https://e-consul.gov.ua",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "Priority": "u=4",
+            "Pragma": "no-cache",
+            "Cache-Control": "no-cache",
+            "TE": "trailers",
+        }
+        if self._cfg.cookies:
+            h["Cookie"] = self._cfg.cookies
+        return h
 
-    snippet = (body_text or "")[:200].replace("\n", " ")
-    return f"{method}: HTTP {status_code} {snippet}"
-
-
-def fetch_schedule() -> dict | None:
-    global _last_api_error
-    data = _api_post("public-calendar-get-actual-consuls-schedule", {"institutionCode": INSTITUTION_CODE})
-    if not data or "data" not in data:
-        return None
-    for item in data["data"]:
-        inner = item.get("data", {})
-        if inner.get("consulIpnHash") == CONSUL_IPN_HASH:
-            return inner
-    _last_api_error = (
-        f"public-calendar-get-actual-consuls-schedule: no consul with CONSUL_IPN_HASH={CONSUL_IPN_HASH[:12]}… "
-        f"(check INSTITUTION_CODE / hash in Settings or .env)"
-    )
-    return None
-
-
-def fetch_reserved_slots() -> list[dict] | None:
-    data = _api_post(
-        "public-get-consuls-reserved-slots",
-        {"institutionCode": INSTITUTION_CODE, "status": [1, 2, 4, 5], "consulIpnHash": [CONSUL_IPN_HASH]},
-    )
-    if not data or "data" not in data:
-        return None
-    return data["data"].get("reservedSlots", [])
-
-
-def _per_day_reserved_counts(slots: list[dict], consul_hash: str) -> dict[date, int]:
-    """Number of reserved slots per calendar day for this consul."""
-    counts: dict[date, int] = {}
-    for s in slots:
-        if s.get("consulIpnHash") != consul_hash:
-            continue
-        fs = (s.get("receptionDateAndTimeFrom") or "")[:10]
-        if len(fs) < 10:
-            continue
+    def _post(self, method: str, filters: dict) -> dict | None:
+        self.last_error = None
         try:
-            d = date.fromisoformat(fs)
-        except ValueError:
-            continue
-        counts[d] = counts.get(d, 0) + 1
-    return counts
+            r = curl_requests.post(
+                API_URL,
+                headers=self._headers(),
+                json={"service": "e-queue-register", "method": method, "filters": filters},
+                timeout=15,
+                impersonate="firefox",
+            )
+        except curl_requests.RequestsError as exc:
+            self.last_error = f"{method}: {exc}"
+            return None
+
+        if r.status_code != 200:
+            body = r.text or ""
+            if r.status_code in (401, 403):
+                self.last_error = self._format_auth_error(method, r.status_code, body)
+            else:
+                self.last_error = f"{method}: HTTP {r.status_code} {body[:240].replace(chr(10), ' ')}"
+            return None
+
+        try:
+            return r.json()
+        except ValueError as exc:
+            self.last_error = f"{method}: invalid JSON ({exc})"
+            return None
+
+    def _format_auth_error(self, method: str, status_code: int, body: str) -> str:
+        """Build a human-readable auth error message from the response body + JWT status."""
+        server_msg = ""
+        try:
+            j = json.loads(body)
+            err = j.get("error") if isinstance(j.get("error"), dict) else None
+            server_msg = (
+                str(err["message"]).strip() if err and err.get("message")
+                else str(j.get("message", "")).strip()
+            )
+        except (json.JSONDecodeError, TypeError, KeyError):
+            pass
+
+        ts = get_token_status(self._cfg.token)
+        if ts.get("exp_utc_iso"):
+            suffix = (
+                f" JWT expiry: {ts['exp_utc_iso']} (already passed)." if ts["expired"]
+                else f" JWT expiry: {ts['exp_utc_iso']} (~{ts.get('expires_in_human', '?')} left)."
+            )
+        else:
+            suffix = f" ({ts.get('issues', '')})"
+
+        if status_code == 401:
+            core = (
+                f"Authentication failed (HTTP 401): TOKEN rejected — usually expired or revoked.{suffix}"
+                + (f' Portal message: "{server_msg}"' if server_msg else "")
+                + " → Log in to e-consul in browser and copy a fresh token."
+            )
+        else:
+            core = (
+                f"Access denied (HTTP 403) — Cloudflare or session mismatch.{suffix}"
+                + (f' Server: "{server_msg}"' if server_msg else "")
+            )
+        return f"{method}: {core}"
+
+    def fetch_schedule(self) -> dict | None:
+        """Fetch this consul's weekly reception schedule."""
+        data = self._post(
+            "public-calendar-get-actual-consuls-schedule",
+            {"institutionCode": self._cfg.institution_code},
+        )
+        if not data or "data" not in data:
+            return None
+        for item in data["data"]:
+            inner = item.get("data", {})
+            if inner.get("consulIpnHash") == self._cfg.consul_ipn_hash:
+                return inner
+        self.last_error = (
+            f"public-calendar-get-actual-consuls-schedule: no consul matching "
+            f"CONSUL_IPN_HASH={self._cfg.consul_ipn_hash[:12]}… "
+            "(check INSTITUTION_CODE / hash in Settings)"
+        )
+        return None
+
+    def fetch_reserved_slots(self) -> list[dict] | None:
+        """Fetch all currently reserved slots for this consul."""
+        data = self._post(
+            "public-get-consuls-reserved-slots",
+            {
+                "institutionCode": self._cfg.institution_code,
+                "status": [1, 2, 4, 5],
+                "consulIpnHash": [self._cfg.consul_ipn_hash],
+            },
+        )
+        if not data or "data" not in data:
+            return None
+        return data["data"].get("reservedSlots", [])
 
 
-def _allowed_booking_days_from_high_anchors(
-    counts: dict[date, int],
-    high_threshold: int,
-    max_gap_calendar_days: int,
-    min_zeros_major_bridge: int,
-) -> tuple[set[date], int, int, date | None]:
-    """
-    Bookable days ≈ portal “waves”:
-    - Anchor day: reserved count >= high_threshold (busy day ⇒ full grid was offered).
-    - Bridge: calendar days with **zero** reservations strictly between two consecutive anchors
-      a < b when (b - a).days <= max_gap_calendar_days **and** the gap contains at least
-      ``min_zeros_major_bridge`` zero days. Small gaps (e.g. span 5 with ~3 weekend zeros)
-      are **not** bridged — avoids phantom slots Mar–Jul while still opening Aug 12→24
-      (10 zero days Aug 14–23 in sample data).
+# ---------------------------------------------------------------------------
+# Scheduling logic — pure functions (no I/O, fully testable)
+# ---------------------------------------------------------------------------
 
-    Then **drop** every bookable day **before** the first calendar day that appears in any
-    qualifying zero-bridge (portal only “shows” the current wave forward). If there is no
-    major bridge yet, keep all anchors (no cutoff) so new consuls still work.
-
-    Days with a few reservations but below threshold (e.g. 17) are excluded — no fake “free” slots.
-    """
-    high_days = sorted(d for d, c in counts.items() if c >= high_threshold)
-    allowed: set[date] = set(high_days)
-    zero_days_added = 0
-    first_major_zero: date | None = None
-    for i in range(len(high_days) - 1):
-        a, b = high_days[i], high_days[i + 1]
-        span = (b - a).days
-        if span <= 1 or span > max_gap_calendar_days:
-            continue
-        gap_zeros: list[date] = []
-        d = a + timedelta(days=1)
-        while d < b:
-            if counts.get(d, 0) == 0:
-                gap_zeros.append(d)
-            d += timedelta(days=1)
-        if len(gap_zeros) < min_zeros_major_bridge:
-            continue
-        for z in gap_zeros:
-            allowed.add(z)
-        zero_days_added += len(gap_zeros)
-        gz_min = min(gap_zeros)
-        if first_major_zero is None or gz_min < first_major_zero:
-            first_major_zero = gz_min
-    cutoff = first_major_zero
-    if cutoff is not None:
-        allowed = {d for d in allowed if d >= cutoff}
-    return allowed, len(high_days), zero_days_added, cutoff
-
-
-def _parse_time(s: str) -> tuple[int, int]:
-    m = re.match(r"^(\d{1,2}):(\d{2})$", (s or "").strip())
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    """Parse 'HH:MM' or 'HH:MM:SS' string → (hours, minutes). Returns (0, 0) on failure."""
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", (s or "").strip())
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
-def _generate_possible_slots(
+def per_day_counts(slots: list[dict], consul_hash: str) -> Counter[date]:
+    """Count reserved slots per calendar day for the given consul hash."""
+    counts: Counter[date] = Counter()
+    for s in slots:
+        if s.get("consulIpnHash") != consul_hash:
+            continue
+        raw = (s.get("receptionDateAndTimeFrom") or "")[:10]
+        if len(raw) < 10:
+            continue
+        try:
+            counts[date.fromisoformat(raw)] += 1
+        except ValueError:
+            pass
+    return counts
+
+
+def bookable_days(
+    counts: Counter[date],
+    high_threshold: int = 20,
+    max_gap_days: int = 15,
+    min_zero_span: int = 7,
+) -> tuple[set[date], dict]:
+    """
+    Determine which calendar days the portal treats as part of the active booking wave.
+
+    Algorithm:
+      1. Anchors — days where reserved count >= high_threshold. These are days the
+         portal opened a full slot grid; many slots are already taken.
+      2. Bridges — zero-reservation days strictly between two consecutive anchors when:
+           * the calendar gap is <= max_gap_days (same wave, not months apart), AND
+           * the gap contains >= min_zero_span zero days (a 3-day weekend is excluded;
+             a free working week of ~7 days qualifies).
+      3. Wave cutoff — drop everything before the earliest qualifying bridge. Older
+         anchor days belong to a past wave the portal no longer offers.
+
+    Returns (bookable_dates, meta_dict).
+    """
+    anchors = sorted(d for d, c in counts.items() if c >= high_threshold)
+    allowed: set[date] = set(anchors)
+    first_bridge_start: date | None = None
+
+    for a, b in zip(anchors, anchors[1:]):
+        gap = (b - a).days
+        if not (1 < gap <= max_gap_days):
+            continue
+
+        # All calendar days strictly between the two anchors that have 0 reservations
+        zeros = [
+            date.fromordinal(o)
+            for o in range(a.toordinal() + 1, b.toordinal())
+            if counts.get(date.fromordinal(o), 0) == 0
+        ]
+        if len(zeros) < min_zero_span:
+            continue
+
+        # Trim Mon–Fri zero days that are immediately adjacent to either anchor.
+        # A working day right after anchor a (or right before anchor b) is likely
+        # a "not yet opened" day from the old/new batch — not part of the free wave.
+        # Weekend zeros (Sat/Sun) are safe to keep: they never generate slots anyway.
+        if zeros[0].weekday() < 5:       # first zero is Mon–Fri → adjacent to a
+            zeros = zeros[1:]
+        if zeros and zeros[-1].weekday() < 5:  # last zero is Mon–Fri → adjacent to b
+            zeros = zeros[:-1]
+        if not zeros:
+            continue
+
+        allowed.update(zeros)
+        if first_bridge_start is None or zeros[0] < first_bridge_start:
+            first_bridge_start = zeros[0]
+
+    # Drop days that precede the active wave
+    if first_bridge_start is not None:
+        allowed = {d for d in allowed if d >= first_bridge_start}
+
+    return allowed, {
+        "anchor_count": len(anchors),
+        "wave_cutoff": first_bridge_start,
+        "bookable_count": len(allowed),
+    }
+
+
+def generate_slots(
     schedule: dict,
-    watch_start: date,
-    watch_end: date,
     allowed_dates: set[date],
+    slot_minutes: int = 10,
 ) -> set[str]:
-    reception = schedule.get("receptionCitizensTime", [])
-    non_working = schedule.get("nonWorkingTime", [])
-    blocks: list[tuple[int, int, int]] = []
-    for rec in reception:
+    """
+    Expand the weekly reception schedule into concrete 'YYYY-MM-DDTHH:MM' timestamps
+    for every day in allowed_dates.
+
+    Key correctness fix: non-working periods (breaks, one-off holidays) are stored as
+    full datetime pairs and blocked with a proper interval-overlap test —
+        slot [slot_start, slot_end) is blocked when slot_start < nw_to AND slot_end > nw_from
+    rather than the previous point-in-time check that missed slots overlapping a break boundary.
+
+    Key performance fix: iterates only over sorted(allowed_dates) — O(N bookable days)
+    instead of the previous O(HORIZON_DAYS) loop that walked the full 10-year range.
+    """
+    # Map weekday int → list of (start_minute, end_minute) blocks from the weekly schedule
+    day_blocks: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for rec in schedule.get("receptionCitizensTime", []):
         wd = UA_WEEKDAY.get((rec.get("workingDays") or "").strip())
         if wd is None:
             continue
-        h1, m1 = _parse_time(rec.get("workingHoursFrom", "09:00"))
-        h2, m2 = _parse_time(rec.get("workingHoursTo", "12:00"))
+        h1, m1 = _parse_hhmm(rec.get("workingHoursFrom", ""))
+        h2, m2 = _parse_hhmm(rec.get("workingHoursTo", ""))
         start_m, end_m = h1 * 60 + m1, h2 * 60 + m2
         if start_m < end_m:
-            blocks.append((wd, start_m, end_m))
-    nw_ranges: list[tuple[date, dt_time, dt_time]] = []
-    for nw in non_working:
+            day_blocks[wd].append((start_m, end_m))
+
+    # Non-working periods as full datetime pairs for correct overlap arithmetic
+    nw_ranges: list[tuple[datetime, datetime]] = []
+    for nw in schedule.get("nonWorkingTime", []):
         from_s = (nw.get("notWorkingDateAndHoursFrom") or "")[:19]
         to_s = (nw.get("notWorkingDateAndHoursTo") or "")[:19]
         if len(from_s) >= 19 and len(to_s) >= 19:
             try:
-                dt_from = datetime.fromisoformat(from_s)
-                dt_to = datetime.fromisoformat(to_s)
-                nw_ranges.append((dt_from.date(), dt_from.time(), dt_to.time()))
+                nw_ranges.append((
+                    datetime.fromisoformat(from_s),
+                    datetime.fromisoformat(to_s),
+                ))
             except (ValueError, TypeError):
                 pass
-    start_d, end_d = watch_start, watch_end
+
+    slot_delta = timedelta(minutes=slot_minutes)
     possible: set[str] = set()
-    delta = timedelta(minutes=SLOT_MINUTES)
-    d = start_d
-    while d <= end_d:
-        if d not in allowed_dates:
-            d += timedelta(days=1)
-            continue
-        wd = d.weekday()
-        for (b_wd, start_m, end_m) in blocks:
-            if wd != b_wd:
-                continue
-            start_t = dt_time(start_m // 60, start_m % 60)
-            end_t = dt_time(end_m // 60, end_m % 60)
-            slot_start = datetime.combine(d, start_t)
-            end_dt = datetime.combine(d, end_t)
-            while slot_start < end_dt:
-                st = slot_start.time()
-                skip = any(d == nw_d and nw_from <= st < nw_to for (nw_d, nw_from, nw_to) in nw_ranges)
-                if not skip:
-                    possible.add(slot_start.strftime("%Y-%m-%dT%H:%M"))
-                slot_start += delta
-        d += timedelta(days=1)
+
+    for d in sorted(allowed_dates):  # O(N) — iterate bookable days only
+        for start_m, end_m in day_blocks.get(d.weekday(), []):
+            slot_dt = datetime(d.year, d.month, d.day, start_m // 60, start_m % 60)
+            end_dt = datetime(d.year, d.month, d.day, end_m // 60, end_m % 60)
+            while slot_dt < end_dt:
+                slot_end = slot_dt + slot_delta
+                # Full interval overlap: blocked when [slot_dt, slot_end) ∩ [nw_from, nw_to) ≠ ∅
+                blocked = any(slot_dt < nw_to and slot_end > nw_from for nw_from, nw_to in nw_ranges)
+                if not blocked:
+                    possible.add(slot_dt.strftime("%Y-%m-%dT%H:%M"))
+                slot_dt = slot_end
+
     return possible
 
 
-def _reserved_slot_keys(slots: list[dict], watch_start: date, watch_end: date) -> set[str]:
-    start_s = watch_start.isoformat()
-    end_s = watch_end.isoformat()
-    keys = set()
+def reserved_slot_keys(slots: list[dict]) -> set[str]:
+    """
+    Extract 'YYYY-MM-DDTHH:MM' keys from raw reserved-slot records.
+    Uses datetime.fromisoformat to normalise whatever timestamp format the API returns
+    (handles both 'T' and space separators, trailing seconds/microseconds, etc.).
+    """
+    keys: set[str] = set()
     for s in slots:
-        from_s = (s.get("receptionDateAndTimeFrom") or "")
-        if len(from_s) < 16:
+        raw = (s.get("receptionDateAndTimeFrom") or "").replace(" ", "T")
+        if len(raw) < 16:
             continue
-        date_part = from_s[:10]
-        if start_s <= date_part <= end_s:
-            keys.add(from_s[:16].replace(".00", ""))
+        try:
+            keys.add(datetime.fromisoformat(raw[:19]).strftime("%Y-%m-%dT%H:%M"))
+        except ValueError:
+            keys.add(raw[:16])  # Best-effort fallback for unusual formats
     return keys
 
 
+def format_slot_display(slot: str) -> str:
+    """
+    Format an internal slot key for human-readable display.
+
+    Internal keys use ``YYYY-MM-DDTHH:MM``; UI shows ``YYYY-MM-DD HH:MM`` (24-hour).
+    """
+    if not slot:
+        return slot
+    normalized = slot.strip().replace(" ", "T", 1)
+    try:
+        return datetime.fromisoformat(normalized[:19]).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return slot.replace("T", " ", 1)
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
 def get_free_slots() -> tuple[list[str], int, int, date, date, dict] | None:
     """
-    Returns (free_list, free_count, reserved_count, window_start, window_end, meta) or None on error.
-    meta includes cluster/bookable-day stats for the UI.
+    Main entry point: fetch schedule + reserved slots, apply wave heuristic, return free slots.
+
+    Returns (free_list, free_count, reserved_count, window_start, window_end, meta)
+    or None on any API / parse error.
     """
-    watch_start, watch_end = get_booking_window()
-    schedule = fetch_schedule()
-    if not schedule:
+    schedule = _client.fetch_schedule()
+    if schedule is None:
         return None
-    reserved_list = fetch_reserved_slots()
-    if reserved_list is None:
+    raw_slots = _client.fetch_reserved_slots()
+    if raw_slots is None:
         return None
-    counts = _per_day_reserved_counts(reserved_list, CONSUL_IPN_HASH)
-    bookable_all, anchor_count, _, wave_cutoff = _allowed_booking_days_from_high_anchors(
+
+    counts = per_day_counts(raw_slots, _cfg.consul_ipn_hash)
+    allowed, bk_meta = bookable_days(
         counts,
-        HIGH_DAY_RESERVATIONS,
-        MAX_GAP_ZERO_BRIDGE_DAYS,
-        MIN_ZERO_DAYS_MAJOR_BRIDGE,
+        high_threshold=_cfg.high_day_reservations,
+        max_gap_days=_cfg.max_gap_zero_bridge_days,
+        min_zero_span=_cfg.min_zero_days_major_bridge,
     )
-    allowed_dates = {d for d in bookable_all if watch_start <= d <= watch_end}
-    possible = _generate_possible_slots(schedule, watch_start, watch_end, allowed_dates)
-    reserved_keys = _reserved_slot_keys(reserved_list, watch_start, watch_end)
-    free_sorted = sorted(possible - reserved_keys)
-    anchors_in_window = sum(1 for d in allowed_dates if counts.get(d, 0) >= HIGH_DAY_RESERVATIONS)
-    zero_bridged_in_window = sum(1 for d in allowed_dates if counts.get(d, 0) == 0)
+
+    today = date.today()
+    horizon = today + timedelta(days=365 * 3)
+    allowed_in_window = {d for d in allowed if today <= d <= horizon}
+
+    possible = generate_slots(schedule, allowed_in_window, _cfg.slot_minutes)
+    reserved = reserved_slot_keys(raw_slots)
+    free_sorted = sorted(possible - reserved)
+
+    # reserved_count = slots that are possible but already taken (within window)
+    reserved_count = len(possible) - len(free_sorted)
+
+    anchors_in_window = sum(
+        1 for d in allowed_in_window if counts.get(d, 0) >= _cfg.high_day_reservations
+    )
+    zeros_in_window = sum(1 for d in allowed_in_window if counts.get(d, 0) == 0)
+
     meta = {
-        "high_anchor_days_total": anchor_count,
+        "high_anchor_days_total": bk_meta["anchor_count"],
         "high_anchor_days_in_window": anchors_in_window,
-        "zero_days_bridged_in_window": zero_bridged_in_window,
-        "bookable_calendar_days_in_window": len(allowed_dates),
-        "high_day_reservations_threshold": HIGH_DAY_RESERVATIONS,
-        "max_gap_zero_bridge_days": MAX_GAP_ZERO_BRIDGE_DAYS,
-        "min_zero_days_major_bridge": MIN_ZERO_DAYS_MAJOR_BRIDGE,
-        "portal_wave_cutoff_date": wave_cutoff.isoformat() if wave_cutoff else None,
+        "zero_days_bridged_in_window": zeros_in_window,
+        "bookable_calendar_days_in_window": len(allowed_in_window),
+        "high_day_reservations_threshold": _cfg.high_day_reservations,
+        "max_gap_zero_bridge_days": _cfg.max_gap_zero_bridge_days,
+        "min_zero_days_major_bridge": _cfg.min_zero_days_major_bridge,
+        "portal_wave_cutoff_date": (
+            bk_meta["wave_cutoff"].isoformat() if bk_meta["wave_cutoff"] else None
+        ),
     }
-    return free_sorted, len(free_sorted), len(reserved_keys), watch_start, watch_end, meta
+    return free_sorted, len(free_sorted), reserved_count, today, horizon, meta
+
+
+# ---------------------------------------------------------------------------
+# Module singletons — reloaded after settings change
+# ---------------------------------------------------------------------------
+
+_cfg: Config = Config.from_env()
+_client: ApiClient = ApiClient(_cfg)
+
+# Kept as a module-level variable so `from monitor import INTERVAL` in app.py still works
+INTERVAL: int = _cfg.interval
 
 
 def reload_config() -> None:
-    """Reload all settings from .env (call after saving the file)."""
-    global TOKEN, USER_AGENT, COOKIES, INSTITUTION_CODE, CONSUL_IPN_HASH, INTERVAL
-    load_dotenv(ENV_PATH, override=True)
-    TOKEN = (os.getenv("TOKEN", "PASTE_JWT_TOKEN_HERE") or "").strip().strip("'\"")
-    USER_AGENT = (os.getenv("USER_AGENT", "PASTE_USER_AGENT_HERE") or "").strip().strip("'\"")
-    COOKIES = os.getenv("COOKIES", "")
-    INSTITUTION_CODE = os.getenv("INSTITUTION_CODE", DEFAULT_INSTITUTION_CODE)
-    CONSUL_IPN_HASH = os.getenv("CONSUL_IPN_HASH", DEFAULT_CONSUL_IPN_HASH)
-    INTERVAL = _read_interval()
+    """Reload all settings from .env and refresh module singletons."""
+    global _cfg, _client, INTERVAL
+    _cfg = Config.from_env()
+    _client = ApiClient(_cfg)
+    INTERVAL = _cfg.interval
 
+
+def get_last_api_error() -> str | None:
+    return _client.last_error
+
+
+# ---------------------------------------------------------------------------
+# Settings persistence (used by web UI)
+# ---------------------------------------------------------------------------
 
 def get_settings_for_form() -> dict:
-    """Values for the web Settings form (syncs from .env first)."""
+    """Return current settings dict for the web Settings form."""
     reload_config()
     file_token = (dotenv_values(ENV_PATH).get("TOKEN") or "").strip()
-    token_ok = bool(file_token) and not file_token.startswith("PASTE_")
     return {
-        "user_agent": USER_AGENT,
-        "cookies": COOKIES,
-        "interval": INTERVAL,
-        "institution_code": INSTITUTION_CODE,
-        "consul_ipn_hash": CONSUL_IPN_HASH,
-        "token_configured": token_ok,
+        "user_agent": _cfg.user_agent,
+        "cookies": _cfg.cookies,
+        "interval": _cfg.interval,
+        "institution_code": _cfg.institution_code,
+        "consul_ipn_hash": _cfg.consul_ipn_hash,
+        "token_configured": bool(file_token) and not file_token.startswith("PASTE_"),
         "env_path": ENV_PATH,
-        "token_status": get_token_status(),
+        "token_status": get_token_status(_cfg.token),
     }
 
 
@@ -481,11 +581,7 @@ def save_settings_from_form(
     institution_code: str,
     consul_ipn_hash: str,
 ) -> tuple[bool, str]:
-    """Persist settings to .env and reload in-process config. Empty token leaves existing TOKEN unchanged."""
-    Path(ENV_PATH).parent.mkdir(parents=True, exist_ok=True)
-    if not Path(ENV_PATH).is_file():
-        Path(ENV_PATH).touch()
-
+    """Validate, persist to .env, and hot-reload config. Empty token leaves TOKEN unchanged."""
     try:
         iv = max(60, min(86400, int((interval or "300").strip() or "300")))
     except ValueError:
@@ -495,7 +591,7 @@ def save_settings_from_form(
     if not ua:
         return False, "USER_AGENT is required"
     if len(ua) < 40:
-        return False, "USER_AGENT looks incomplete — paste the full value from DevTools → Network (same request as TOKEN)"
+        return False, "USER_AGENT looks incomplete — paste the full value from DevTools → Network"
 
     inst = (institution_code or "").strip()
     consul = (consul_ipn_hash or "").strip()
@@ -503,6 +599,10 @@ def save_settings_from_form(
         return False, "INSTITUTION_CODE and CONSUL_IPN_HASH are required"
     if re.fullmatch(r"[0-9a-fA-F]{64}", consul) is None:
         return False, "CONSUL_IPN_HASH must be 64 hex characters"
+
+    Path(ENV_PATH).parent.mkdir(parents=True, exist_ok=True)
+    if not Path(ENV_PATH).is_file():
+        Path(ENV_PATH).touch()
 
     token_stripped = (token or "").strip()
     if token_stripped:
@@ -518,21 +618,25 @@ def save_settings_from_form(
     return True, f"Saved to {ENV_PATH}"
 
 
-class Monitor:
-    """Runs the check loop in a background thread; start/stop and status for the web UI."""
+# ---------------------------------------------------------------------------
+# Monitor — background loop
+# ---------------------------------------------------------------------------
 
-    def __init__(self):
+class Monitor:
+    """Runs the slot-check loop in a daemon thread; exposes status for the web UI."""
+
+    def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._running = False
         self._last_check_at: str | None = None
-        self._last_result: dict | None = None  # possible, reserved, free_count, first_free
+        self._last_result: dict | None = None
         self._last_error: str | None = None
         self._last_free_count: int | None = None
 
     def _run_loop(self) -> None:
-        while not self._stop.wait(timeout=0):
+        while not self._stop.is_set():
             checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 result = get_free_slots()
@@ -540,33 +644,39 @@ class Monitor:
                     self._last_check_at = checked_at
                     self._last_error = None
                     if result is None:
-                        detail = get_last_api_error()
-                        self._last_error = detail or "API or parse error (check TOKEN, USER_AGENT, network)."
+                        self._last_error = get_last_api_error() or "API or parse error."
                         self._last_result = None
                     else:
                         free_list, free_count, reserved_count, w_start, w_end, meta = result
-                        possible = free_count + reserved_count
                         self._last_result = {
-                            "possible": possible,
+                            "possible": free_count + reserved_count,
                             "reserved": reserved_count,
                             "free_count": free_count,
-                            "first_free": free_list[0] if free_list else None,
+                            "first_free": (
+                                format_slot_display(free_list[0]) if free_list else None
+                            ),
                             "window_start": w_start.isoformat(),
                             "window_end": w_end.isoformat(),
                             **meta,
                         }
+                        prev = self._last_free_count
                         if free_count > 0:
-                            if self._last_free_count is None or self._last_free_count == 0:
-                                self._notify(f"FREE SLOTS: {free_count} available. First: {free_list[0]}")
-                            elif self._last_free_count is not None and free_count > self._last_free_count:
-                                self._notify(f"Free slots increased from {self._last_free_count} to {free_count}.")
+                            if prev is None or prev == 0:
+                                self._notify(
+                                    f"FREE SLOTS: {free_count} available. "
+                                    f"First: {format_slot_display(free_list[0])}"
+                                )
+                            elif free_count > prev:
+                                self._notify(f"Free slots increased from {prev} to {free_count}.")
                         self._last_free_count = free_count
-            except Exception as e:
+            except Exception as exc:
                 with self._lock:
                     self._last_check_at = checked_at
-                    self._last_error = str(e)
+                    self._last_error = str(exc)
                     self._last_result = None
-            self._stop.wait(timeout=INTERVAL)
+
+            # Wait for the configured interval or until stop is signalled
+            self._stop.wait(timeout=_cfg.interval)
 
     def _notify(self, message: str) -> None:
         print(f"\n[ALERT] {message}\n")
@@ -588,7 +698,7 @@ class Monitor:
             self._running = False
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=INTERVAL + 5)
+            self._thread.join(timeout=_cfg.interval + 5)
             self._thread = None
         return True
 
@@ -597,18 +707,18 @@ class Monitor:
             return {
                 "running": self._running,
                 "last_check_at": self._last_check_at,
-                "last_result": self._last_result,
+                "last_result": dict(self._last_result) if self._last_result else None,
                 "last_error": self._last_error,
-                "token": get_token_status(),
+                "token": get_token_status(_cfg.token),
             }
 
 
-# Singleton for the web app
-_monitor: Monitor | None = None
+# Singleton used by the web app
+_monitor_singleton: Monitor | None = None
 
 
 def get_monitor() -> Monitor:
-    global _monitor
-    if _monitor is None:
-        _monitor = Monitor()
-    return _monitor
+    global _monitor_singleton
+    if _monitor_singleton is None:
+        _monitor_singleton = Monitor()
+    return _monitor_singleton
