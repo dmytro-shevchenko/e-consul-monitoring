@@ -3,18 +3,54 @@ Simple web UI: start/stop monitoring, status, and Settings (saved to .env).
 Run: python web_app.py  then open http://127.0.0.1:8080
 """
 import os
-from flask import Flask, request, redirect, url_for, flash, jsonify, render_template_string, get_flashed_messages
+import secrets
+
+from flask import (
+    Flask,
+    flash,
+    get_flashed_messages,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    session,
+    url_for,
+)
 from monitor import (
-    get_monitor,
     BOOKING_LINK,
+    get_monitor,
     get_settings_for_form,
     save_settings_from_form,
 )
 
+# Loads .env (via monitor import); WEB_USERNAME + WEB_PASSWORD optional single-user gate
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-e-consul-monitor-change-me")
 
-NAV = '<p style="margin-top:1rem;"><a href="/">Dashboard</a> · <a href="/settings">Settings</a></p>'
+
+def _web_auth_configured() -> bool:
+    return bool((os.getenv("WEB_USERNAME") or "").strip() and (os.getenv("WEB_PASSWORD") or "").strip())
+
+
+def _web_session_ok() -> bool:
+    return session.get("web_auth") is True
+
+
+def _web_check_credentials(username: str, password: str) -> bool:
+    u_exp = (os.getenv("WEB_USERNAME") or "").strip()
+    p_exp = (os.getenv("WEB_PASSWORD") or "").strip()
+    u_in, p_in = username.encode("utf-8"), password.encode("utf-8")
+    u_ok, p_ok = u_exp.encode("utf-8"), p_exp.encode("utf-8")
+    if len(u_in) != len(u_ok) or len(p_in) != len(p_ok):
+        return False
+    return secrets.compare_digest(u_in, u_ok) and secrets.compare_digest(p_in, p_ok)
+
+
+def nav_html() -> str:
+    s = '<p style="margin-top:1rem;"><a href="/">Dashboard</a> · <a href="/settings">Settings</a>'
+    if _web_auth_configured():
+        s += ' · <a href="/logout">Log out</a>'
+    return s + "</p>"
 
 INDEX_HTML = """
 <!DOCTYPE html>
@@ -50,7 +86,7 @@ INDEX_HTML = """
   </div>
   <div id="status">Loading status…</div>
   <p style="margin-top: 1rem;"><a href="{{ booking_link }}" target="_blank">Book on e-consul.gov.ua</a></p>
-  """ + NAV + """
+  {{ nav_html|safe }}
   <script>
     function escapeHtml(s) {
       if (!s) return '';
@@ -160,10 +196,90 @@ SETTINGS_HTML = """
 
     <button type="submit">Save to .env</button>
   </form>
-  """ + NAV + """
+  {{ nav_html|safe }}
 </body>
 </html>
 """
+
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — e-Consul Monitor</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 360px; margin: 3rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; }
+    label { display: block; margin-top: 1rem; font-weight: 600; font-size: 0.85rem; }
+    input { width: 100%; padding: 0.5rem; margin-top: 0.25rem; font-size: 1rem; }
+    button { margin-top: 1.25rem; padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; width: 100%; }
+    .flash { padding: 0.75rem; background: #ffebee; border-radius: 6px; margin: 1rem 0; font-size: 0.9rem; }
+    .hint { font-size: 0.8rem; color: #555; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>e-Consul Monitor</h1>
+  {% for c, m in get_flashed_messages(with_categories=true) %}
+  <div class="flash">{{ m }}</div>
+  {% endfor %}
+  <form method="post" action="{{ url_for('login') }}">
+    <input type="hidden" name="next" value="{{ next or '' }}">
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username" required autofocus>
+    <label for="password">Password</label>
+    <input id="password" type="password" name="password" autocomplete="current-password" required>
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>
+"""
+
+
+@app.before_request
+def _require_web_login():
+    if not _web_auth_configured():
+        return None
+    if request.endpoint in ("login", "static") or request.path == "/favicon.ico":
+        return None
+    if _web_session_ok():
+        return None
+    if request.accept_mimetypes.best == "application/json" and request.path.startswith("/"):
+        return jsonify({"error": "authentication required"}), 401
+    return redirect(url_for("login", next=request.path))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not _web_auth_configured():
+        return redirect(url_for("index"))
+    if request.method == "POST":
+        if _web_check_credentials(
+            (request.form.get("username") or "").strip(),
+            (request.form.get("password") or "").strip(),
+        ):
+            session["web_auth"] = True
+            session.permanent = True
+            nxt = (request.form.get("next") or request.args.get("next") or "").strip()
+            if not nxt.startswith("/") or nxt.startswith("//"):
+                nxt = url_for("index")
+            return redirect(nxt)
+        flash("Invalid username or password.", "error")
+    return render_template_string(
+        LOGIN_HTML,
+        get_flashed_messages=get_flashed_messages,
+        next=request.args.get("next", ""),
+        url_for=url_for,
+    )
+
+
+@app.route("/logout")
+def logout():
+    session.pop("web_auth", None)
+    if _web_auth_configured():
+        return redirect(url_for("login"))
+    return redirect(url_for("index"))
 
 
 @app.route("/")
@@ -172,6 +288,7 @@ def index():
         INDEX_HTML,
         booking_link=BOOKING_LINK,
         get_flashed_messages=get_flashed_messages,
+        nav_html=nav_html(),
     )
 
 
@@ -210,6 +327,7 @@ def settings():
         telegram_bot_token=s["telegram_bot_token"],
         telegram_chat_id=s["telegram_chat_id"],
         token_status=s["token_status"],
+        nav_html=nav_html(),
     )
 
 
