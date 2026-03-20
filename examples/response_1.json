@@ -1777,21 +1777,7 @@
         "receptionDateAndTimeTo": "2026-03-30T16:50:00.00-07:00",
         "receptionDateAndTimeFrom": "2026-03-30T16:40:00.00-07:00"
       },
-      {
-        "consulIpnHash": "90ed02ab516eecbe60b758139ec26d32498df7f83e02d89be5a5ff69afa46e4c",
-        "receptionDateAndTimeTo": "2026-03-30T10:15:00.00-07:00",
-        "receptionDateAndTimeFrom": "2026-03-30T10:00:00.00-07:00"
-      },
-      {
-        "consulIpnHash": "90ed02ab516eecbe60b758139ec26d32498df7f83e02d89be5a5ff69afa46e4c",
-        "receptionDateAndTimeTo": "2026-03-30T11:30:00.00-07:00",
-        "receptionDateAndTimeFrom": "2026-03-30T11:20:00.00-07:00"
-      },
-      {
-        "consulIpnHash": "90ed02ab516eecbe60b758139ec26d32498df7f83e02d89be5a5ff69afa46e4c",
-        "receptionDateAndTimeTo": "2026-03-30T14:20:00.00-07:00",
-        "receptionDateAndTimeFrom": "2026-03-30T14:10:00.00-07:00"
-      },
+
       {
         "consulIpnHash": "90ed02ab516eecbe60b758139ec26d32498df7f83e02d89be5a5ff69afa46e4c",
         "receptionDateAndTimeTo": "2026-03-30T11:50:00.00-07:00",

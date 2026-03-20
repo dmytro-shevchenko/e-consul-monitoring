@@ -51,6 +51,8 @@ the value of the **token** header (long JWT string) and the **User-Agent** heade
 
 3. Notification Payload
 
+Optional **Telegram**: set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` (or Settings). The monitor POSTs to `api.telegram.org/bot…/sendMessage` with HTML formatting; leave either variable empty to disable.
+
 When a slot is detected, the agent should trigger a notification (Telegram/Webhook) containing:
 
 - Date/Time of slot.

@@ -5,6 +5,7 @@ Run loop in a thread with start/stop; expose current status for the web UI.
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
 import re
@@ -62,6 +63,8 @@ class Config:
     operation_name: str
     consul_ipn_hash: str  # optional filter: empty = all consuls that offer OPERATION_NAME
     interval: int
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
     dry_run: bool = False
     slot_minutes: int = 10  # API uses 10-minute slots
 
@@ -85,6 +88,8 @@ class Config:
             operation_name=_s("OPERATION_NAME", DEFAULT_OPERATION_NAME),
             consul_ipn_hash=_s("CONSUL_IPN_HASH"),
             interval=interval,
+            telegram_bot_token=_s("TELEGRAM_BOT_TOKEN"),
+            telegram_chat_id=_s("TELEGRAM_CHAT_ID"),
             dry_run=_env_truthy("DRY_RUN"),
         )
 
@@ -644,6 +649,35 @@ def get_last_api_error() -> str | None:
     return _client.last_error
 
 
+def send_telegram_alert(message: str) -> None:
+    """
+    POST to Telegram Bot API sendMessage. No-op if TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is unset.
+    Never raises; logs a short line on failure.
+    """
+    tok = (_cfg.telegram_bot_token or "").strip()
+    chat = (_cfg.telegram_chat_id or "").strip()
+    if not tok or not chat:
+        return
+    text = f"🚨 <b>e-Consul alert</b>\n\n{html.escape(message)}"
+    url = f"https://api.telegram.org/bot{tok}/sendMessage"
+    try:
+        r = curl_requests.post(
+            url,
+            json={
+                "chat_id": chat,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=5,
+            impersonate="firefox",
+        )
+        if r.status_code != 200:
+            print(f"[Telegram] HTTP {r.status_code}: {(r.text or '')[:200]}")
+    except Exception as exc:
+        print(f"[Telegram] {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Settings persistence (used by web UI)
 # ---------------------------------------------------------------------------
@@ -659,6 +693,8 @@ def get_settings_for_form() -> dict:
         "institution_code": _cfg.institution_code,
         "operation_name": _cfg.operation_name,
         "consul_ipn_hash": _cfg.consul_ipn_hash,
+        "telegram_bot_token": _cfg.telegram_bot_token,
+        "telegram_chat_id": _cfg.telegram_chat_id,
         "token_configured": bool(file_token) and not file_token.startswith("PASTE_"),
         "env_path": ENV_PATH,
         "token_status": get_token_status(_cfg.token),
@@ -674,6 +710,8 @@ def save_settings_from_form(
     institution_code: str,
     operation_name: str,
     consul_ipn_hash: str,
+    telegram_bot_token: str | None = None,
+    telegram_chat_id: str | None = None,
 ) -> tuple[bool, str]:
     """Validate, persist to .env, and hot-reload config. Empty token leaves TOKEN unchanged."""
     try:
@@ -711,6 +749,10 @@ def save_settings_from_form(
     set_key(ENV_PATH, "INSTITUTION_CODE", inst, quote_mode="always")
     set_key(ENV_PATH, "OPERATION_NAME", op, quote_mode="always")
     set_key(ENV_PATH, "CONSUL_IPN_HASH", consul, quote_mode="always")
+    tg_tok = (telegram_bot_token or "").strip()
+    if tg_tok:
+        set_key(ENV_PATH, "TELEGRAM_BOT_TOKEN", tg_tok, quote_mode="always")
+    set_key(ENV_PATH, "TELEGRAM_CHAT_ID", (telegram_chat_id or "").strip(), quote_mode="always")
 
     reload_config()
     return True, f"Saved to {ENV_PATH}"
@@ -761,11 +803,14 @@ class Monitor:
                         if free_count > 0:
                             if prev is None or prev == 0:
                                 self._notify(
-                                    f"FREE SLOTS: {free_count} available. "
+                                    f"FREE SLOTS FOUND.\n"
                                     f"First: {format_slot_display(free_list[0])}"
                                 )
                             elif free_count > prev:
-                                self._notify(f"Free slots increased from {prev} to {free_count}.")
+                                self._notify(
+                                    f"Number of free slots increased!\n"
+                                    f"First: {format_slot_display(free_list[0])}"
+                                )
                         self._last_free_count = free_count
             except Exception as exc:
                 with self._lock:
@@ -778,6 +823,7 @@ class Monitor:
 
     def _notify(self, message: str) -> None:
         print(f"\n[ALERT] {message}\n")
+        send_telegram_alert(message)
 
     def start(self) -> bool:
         with self._lock:
