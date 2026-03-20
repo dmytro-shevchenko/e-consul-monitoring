@@ -10,7 +10,7 @@ import os
 import re
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -24,19 +24,27 @@ from dotenv import dotenv_values, load_dotenv, set_key
 
 _BASE_DIR = Path(__file__).parent
 ENV_PATH = str(_BASE_DIR / ".env")
+EXAMPLES_DIR = _BASE_DIR / "examples"
+# Fixed filenames for DRY_RUN (same shape as live API responses)
+DRY_RUN_SCHEDULE_FILE = "response_2.json"
+DRY_RUN_RESERVED_FILE = "response_1.json"
 load_dotenv(ENV_PATH)
 
 API_URL = "https://my.e-consul.gov.ua/external_reader"
 BOOKING_LINK = "https://e-consul.gov.ua/tasks/create/161374/161374001"
 
 DEFAULT_INSTITUTION_CODE = "1000000514"
-DEFAULT_CONSUL_IPN_HASH = "90ed02ab516eecbe60b758139ec26d32498df7f83e02d89be5a5ff69afa46e4c"
+DEFAULT_OPERATION_NAME = "Оформлення закордонного паспорта"
 
 # Ukrainian weekday names → Python weekday number (Mon=0)
 UA_WEEKDAY: dict[str, int] = {
     "понеділок": 0, "вівторок": 1, "середа": 2, "четвер": 3,
     "п'ятниця": 4, "пятниця": 4, "субота": 5, "неділя": 6,
 }
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -51,14 +59,11 @@ class Config:
     user_agent: str
     cookies: str
     institution_code: str
-    consul_ipn_hash: str
+    operation_name: str
+    consul_ipn_hash: str  # optional filter: empty = all consuls that offer OPERATION_NAME
     interval: int
-
-    # Wave-detection heuristic tuning (rarely need changing)
-    slot_minutes: int = 10
-    high_day_reservations: int = 20      # min reservations to treat a day as an "anchor"
-    max_gap_zero_bridge_days: int = 15   # max calendar gap between two anchors to bridge
-    min_zero_days_major_bridge: int = 7  # min zero days in that gap to qualify as a wave
+    dry_run: bool = False
+    slot_minutes: int = 10  # API uses 10-minute slots
 
     @classmethod
     def from_env(cls) -> Config:
@@ -77,8 +82,10 @@ class Config:
             user_agent=_s("USER_AGENT", "PASTE_USER_AGENT_HERE"),
             cookies=_s("COOKIES"),
             institution_code=_s("INSTITUTION_CODE", DEFAULT_INSTITUTION_CODE),
-            consul_ipn_hash=_s("CONSUL_IPN_HASH", DEFAULT_CONSUL_IPN_HASH),
+            operation_name=_s("OPERATION_NAME", DEFAULT_OPERATION_NAME),
+            consul_ipn_hash=_s("CONSUL_IPN_HASH"),
             interval=interval,
+            dry_run=_env_truthy("DRY_RUN"),
         )
 
     @property
@@ -167,6 +174,17 @@ class ApiClient:
         self._cfg = config
         self.last_error: str | None = None
 
+    def _load_example_json(self, filename: str) -> dict | None:
+        path = EXAMPLES_DIR / filename
+        if not path.is_file():
+            self.last_error = f"DRY_RUN: missing {path}"
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.last_error = f"DRY_RUN: {path}: {exc}"
+            return None
+
     def _headers(self) -> dict[str, str]:
         h: dict[str, str] = {
             "User-Agent": self._cfg.user_agent,
@@ -253,35 +271,35 @@ class ApiClient:
             )
         return f"{method}: {core}"
 
-    def fetch_schedule(self) -> dict | None:
-        """Fetch this consul's weekly reception schedule."""
-        data = self._post(
-            "public-calendar-get-actual-consuls-schedule",
-            {"institutionCode": self._cfg.institution_code},
-        )
+    def fetch_institution_schedule(self) -> dict | None:
+        """Full institution payload: `data` is a list of consul schedule blocks."""
+        if self._cfg.dry_run:
+            data = self._load_example_json(DRY_RUN_SCHEDULE_FILE)
+        else:
+            data = self._post(
+                "public-calendar-get-actual-consuls-schedule",
+                {"institutionCode": self._cfg.institution_code},
+            )
         if not data or "data" not in data:
             return None
-        for item in data["data"]:
-            inner = item.get("data", {})
-            if inner.get("consulIpnHash") == self._cfg.consul_ipn_hash:
-                return inner
-        self.last_error = (
-            f"public-calendar-get-actual-consuls-schedule: no consul matching "
-            f"CONSUL_IPN_HASH={self._cfg.consul_ipn_hash[:12]}… "
-            "(check INSTITUTION_CODE / hash in Settings)"
-        )
-        return None
+        return data
 
-    def fetch_reserved_slots(self) -> list[dict] | None:
-        """Fetch all currently reserved slots for this consul."""
-        data = self._post(
-            "public-get-consuls-reserved-slots",
-            {
-                "institutionCode": self._cfg.institution_code,
-                "status": [1, 2, 4, 5],
-                "consulIpnHash": [self._cfg.consul_ipn_hash],
-            },
-        )
+    def fetch_reserved_slots(self, consul_hashes: list[str]) -> list[dict] | None:
+        """Reserved slots for the given consul IPN hashes (single API call)."""
+        if not consul_hashes:
+            self.last_error = "public-get-consuls-reserved-slots: no consul hashes"
+            return None
+        if self._cfg.dry_run:
+            data = self._load_example_json(DRY_RUN_RESERVED_FILE)
+        else:
+            data = self._post(
+                "public-get-consuls-reserved-slots",
+                {
+                    "institutionCode": self._cfg.institution_code,
+                    "status": [1, 2, 4, 5],
+                    "consulIpnHash": consul_hashes,
+                },
+            )
         if not data or "data" not in data:
             return None
         return data["data"].get("reservedSlots", [])
@@ -297,85 +315,83 @@ def _parse_hhmm(s: str) -> tuple[int, int]:
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
-def per_day_counts(slots: list[dict], consul_hash: str) -> Counter[date]:
-    """Count reserved slots per calendar day for the given consul hash."""
-    counts: Counter[date] = Counter()
-    for s in slots:
-        if s.get("consulIpnHash") != consul_hash:
-            continue
-        raw = (s.get("receptionDateAndTimeFrom") or "")[:10]
-        if len(raw) < 10:
-            continue
-        try:
-            counts[date.fromisoformat(raw)] += 1
-        except ValueError:
-            pass
-    return counts
+def _block_lists_operation(inner: dict, operation_name: str) -> bool:
+    op = (operation_name or "").strip()
+    if not op:
+        return False
+    for svc in inner.get("consularInstitutionService") or []:
+        if (svc.get("name") or "").strip() == op:
+            return True
+    return False
 
 
-def bookable_days(
-    counts: Counter[date],
-    high_threshold: int = 20,
-    max_gap_days: int = 15,
-    min_zero_span: int = 7,
-) -> tuple[set[date], dict]:
+def merge_schedule_for_operation(
+    institution_rows: list,
+    operation_name: str,
+    consul_ipn_hash: str,
+) -> tuple[dict | None, list[str], str | None]:
     """
-    Determine which calendar days the portal treats as part of the active booking wave.
+    Collect every institution `data` block that lists this operation in consularInstitutionService,
+    optionally narrowed to CONSUL_IPN_HASH. Merge receptionCitizensTime and nonWorkingTime.
 
-    Algorithm:
-      1. Anchors — days where reserved count >= high_threshold. These are days the
-         portal opened a full slot grid; many slots are already taken.
-      2. Bridges — zero-reservation days strictly between two consecutive anchors when:
-           * the calendar gap is <= max_gap_days (same wave, not months apart), AND
-           * the gap contains >= min_zero_span zero days (a 3-day weekend is excluded;
-             a free working week of ~7 days qualifies).
-      3. Wave cutoff — drop everything before the earliest qualifying bridge. Older
-         anchor days belong to a past wave the portal no longer offers.
-
-    Returns (bookable_dates, meta_dict).
+    Returns (merged_schedule_dict, ordered_unique_consul_hashes, error_message).
     """
-    anchors = sorted(d for d, c in counts.items() if c >= high_threshold)
-    allowed: set[date] = set(anchors)
-    first_bridge_start: date | None = None
-
-    for a, b in zip(anchors, anchors[1:]):
-        gap = (b - a).days
-        if not (1 < gap <= max_gap_days):
+    want_hash = (consul_ipn_hash or "").strip()
+    blocks: list[dict] = []
+    for row in institution_rows:
+        if not isinstance(row, dict):
             continue
-
-        # All calendar days strictly between the two anchors that have 0 reservations
-        zeros = [
-            date.fromordinal(o)
-            for o in range(a.toordinal() + 1, b.toordinal())
-            if counts.get(date.fromordinal(o), 0) == 0
-        ]
-        if len(zeros) < min_zero_span:
+        inner = row.get("data") or {}
+        if not _block_lists_operation(inner, operation_name):
             continue
-
-        # Trim Mon–Fri zero days that are immediately adjacent to either anchor.
-        # A working day right after anchor a (or right before anchor b) is likely
-        # a "not yet opened" day from the old/new batch — not part of the free wave.
-        # Weekend zeros (Sat/Sun) are safe to keep: they never generate slots anyway.
-        if zeros[0].weekday() < 5:       # first zero is Mon–Fri → adjacent to a
-            zeros = zeros[1:]
-        if zeros and zeros[-1].weekday() < 5:  # last zero is Mon–Fri → adjacent to b
-            zeros = zeros[:-1]
-        if not zeros:
+        if want_hash and inner.get("consulIpnHash") != want_hash:
             continue
+        blocks.append(inner)
 
-        allowed.update(zeros)
-        if first_bridge_start is None or zeros[0] < first_bridge_start:
-            first_bridge_start = zeros[0]
+    if not blocks:
+        hint = f" with CONSUL_IPN_HASH={want_hash[:12]}…" if want_hash else ""
+        return None, [], f"No schedule lists operation {operation_name!r}{hint}"
 
-    # Drop days that precede the active wave
-    if first_bridge_start is not None:
-        allowed = {d for d in allowed if d >= first_bridge_start}
+    merged: dict = {"receptionCitizensTime": [], "nonWorkingTime": []}
+    hashes: list[str] = []
+    for inner in blocks:
+        h = inner.get("consulIpnHash")
+        if isinstance(h, str) and h and h not in hashes:
+            hashes.append(h)
+        merged["receptionCitizensTime"].extend(inner.get("receptionCitizensTime") or [])
+        merged["nonWorkingTime"].extend(inner.get("nonWorkingTime") or [])
 
-    return allowed, {
-        "anchor_count": len(anchors),
-        "wave_cutoff": first_bridge_start,
-        "bookable_count": len(allowed),
-    }
+    if not hashes:
+        return None, [], "Schedule blocks list the operation but consulIpnHash is missing"
+
+    return merged, hashes, None
+
+
+def reception_weekdays(schedule: dict) -> set[int]:
+    """Weekday indices (Mon=0) that have at least one receptionCitizensTime row."""
+    out: set[int] = set()
+    for rec in schedule.get("receptionCitizensTime") or []:
+        wd = UA_WEEKDAY.get((rec.get("workingDays") or "").strip())
+        if wd is not None:
+            out.add(wd)
+    return out
+
+
+def dates_in_window_for_weekdays(today: date, horizon: date, weekdays: set[int]) -> set[date]:
+    """Every calendar day from today through horizon whose weekday is in weekdays."""
+    out: set[date] = set()
+    d = today
+    one = timedelta(days=1)
+    while d <= horizon:
+        if d.weekday() in weekdays:
+            out.add(d)
+        d += one
+    return out
+
+
+def _naive_wall(dt: datetime) -> datetime:
+    """Strip tz so slot intervals compare to API non-working windows as wall-clock."""
+    return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
 
 def generate_slots(
@@ -414,10 +430,9 @@ def generate_slots(
         to_s = (nw.get("notWorkingDateAndHoursTo") or "")[:19]
         if len(from_s) >= 19 and len(to_s) >= 19:
             try:
-                nw_ranges.append((
-                    datetime.fromisoformat(from_s),
-                    datetime.fromisoformat(to_s),
-                ))
+                nw_ranges.append(
+                    (_naive_wall(datetime.fromisoformat(from_s)), _naive_wall(datetime.fromisoformat(to_s)))
+                )
             except (ValueError, TypeError):
                 pass
 
@@ -439,22 +454,95 @@ def generate_slots(
     return possible
 
 
-def reserved_slot_keys(slots: list[dict]) -> set[str]:
-    """
-    Extract 'YYYY-MM-DDTHH:MM' keys from raw reserved-slot records.
-    Uses datetime.fromisoformat to normalise whatever timestamp format the API returns
-    (handles both 'T' and space separators, trailing seconds/microseconds, etc.).
-    """
-    keys: set[str] = set()
-    for s in slots:
-        raw = (s.get("receptionDateAndTimeFrom") or "").replace(" ", "T")
-        if len(raw) < 16:
+def _parse_api_datetime(raw: str) -> datetime | None:
+    """Parse reservation / API timestamp to naive wall-clock datetime for interval tests."""
+    s = (raw or "").strip().replace(" ", "T")
+    if not s:
+        return None
+    for candidate in (s, s[:26], s[:19]):
+        if len(candidate) < 19:
             continue
         try:
-            keys.add(datetime.fromisoformat(raw[:19]).strftime("%Y-%m-%dT%H:%M"))
+            return _naive_wall(datetime.fromisoformat(candidate))
         except ValueError:
-            keys.add(raw[:16])  # Best-effort fallback for unusual formats
-    return keys
+            continue
+    return None
+
+
+def reserved_busy_intervals(slots: list[dict], consul_hashes: set[str] | None) -> list[tuple[datetime, datetime]]:
+    """Busy [from, to) intervals from reserved slots (any duration)."""
+    out: list[tuple[datetime, datetime]] = []
+    for s in slots:
+        h = s.get("consulIpnHash")
+        if consul_hashes is not None and h not in consul_hashes:
+            continue
+        fr = _parse_api_datetime(s.get("receptionDateAndTimeFrom") or "")
+        to = _parse_api_datetime(s.get("receptionDateAndTimeTo") or "")
+        if fr is None or to is None or fr >= to:
+            continue
+        out.append((fr, to))
+    return out
+
+
+def _intervals_overlap(a0: datetime, a1: datetime, b0: datetime, b1: datetime) -> bool:
+    """[a0,a1) overlaps [b0,b1) (half-open)."""
+    return a0 < b1 and a1 > b0
+
+
+def _reserved_intervals_by_calendar_day(
+    reserved_intervals: list[tuple[datetime, datetime]],
+) -> dict[date, list[tuple[datetime, datetime]]]:
+    """Map each calendar day to reservations that intersect that day (for fast slot lookup)."""
+    by_day: dict[date, list[tuple[datetime, datetime]]] = defaultdict(list)
+    one = timedelta(days=1)
+    for fr, to in reserved_intervals:
+        d = fr.date()
+        end_d = to.date()
+        while d <= end_d:
+            by_day[d].append((fr, to))
+            d += one
+    return by_day
+
+
+def possible_slots_not_overlapping_reservations(
+    possible: set[str],
+    reserved_intervals: list[tuple[datetime, datetime]],
+    slot_minutes: int,
+) -> set[str]:
+    """
+    Keep each slot_minutes grid slot [t, t+slot) only if it does not overlap any busy reservation.
+    Reservations may be longer or shorter than slot_minutes (e.g. 15 min booking blocks 09:40).
+    """
+    delta = timedelta(minutes=slot_minutes)
+    by_day = _reserved_intervals_by_calendar_day(reserved_intervals)
+    free: set[str] = set()
+    for key in possible:
+        ss = _slot_key_datetime(key)
+        if ss is None:
+            continue
+        se = ss + delta
+        candidates = by_day.get(ss.date(), [])
+        if any(_intervals_overlap(ss, se, rf, rt) for rf, rt in candidates):
+            continue
+        free.add(key)
+    return free
+
+
+def _slot_key_datetime(slot_key: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(slot_key.strip().replace(" ", "T")[:19])
+    except ValueError:
+        return None
+
+
+def _slot_starts_at_or_after_now(slot_key: str, *, now: datetime | None = None) -> bool:
+    """True if slot start is >= current local time rounded down to the minute (bookable / not in the past)."""
+    dt = _slot_key_datetime(slot_key)
+    if dt is None:
+        return True
+    t = now if now is not None else datetime.now()
+    t = t.replace(second=0, microsecond=0)
+    return dt >= t
 
 
 def format_slot_display(slot: str) -> str:
@@ -478,53 +566,53 @@ def format_slot_display(slot: str) -> str:
 
 def get_free_slots() -> tuple[list[str], int, int, date, date, dict] | None:
     """
-    Main entry point: fetch schedule + reserved slots, apply wave heuristic, return free slots.
+    Schedule for OPERATION_NAME (merged across matching consul blocks) minus reserved = free.
+
+    A 10-minute candidate is free only if [start, start+10m) does not overlap any reservation
+    [from, to) (bookings may be any length).
+
+    Returned free slots exclude intervals whose start is before the current local minute
+    (so the first slot is never a past time on the same day).
 
     Returns (free_list, free_count, reserved_count, window_start, window_end, meta)
     or None on any API / parse error.
     """
-    schedule = _client.fetch_schedule()
-    if schedule is None:
+    payload = _client.fetch_institution_schedule()
+    if payload is None:
         return None
-    raw_slots = _client.fetch_reserved_slots()
+
+    schedule, consul_hashes, err = merge_schedule_for_operation(
+        payload["data"],
+        _cfg.operation_name,
+        _cfg.consul_ipn_hash,
+    )
+    if err or schedule is None:
+        _client.last_error = err or "merge_schedule_for_operation failed"
+        return None
+
+    raw_slots = _client.fetch_reserved_slots(consul_hashes)
     if raw_slots is None:
         return None
 
-    counts = per_day_counts(raw_slots, _cfg.consul_ipn_hash)
-    allowed, bk_meta = bookable_days(
-        counts,
-        high_threshold=_cfg.high_day_reservations,
-        max_gap_days=_cfg.max_gap_zero_bridge_days,
-        min_zero_span=_cfg.min_zero_days_major_bridge,
-    )
-
     today = date.today()
     horizon = today + timedelta(days=365 * 3)
-    allowed_in_window = {d for d in allowed if today <= d <= horizon}
+    wdays = reception_weekdays(schedule)
+    allowed_in_window = dates_in_window_for_weekdays(today, horizon, wdays)
 
     possible = generate_slots(schedule, allowed_in_window, _cfg.slot_minutes)
-    reserved = reserved_slot_keys(raw_slots)
-    free_sorted = sorted(possible - reserved)
-
-    # reserved_count = slots that are possible but already taken (within window)
-    reserved_count = len(possible) - len(free_sorted)
-
-    anchors_in_window = sum(
-        1 for d in allowed_in_window if counts.get(d, 0) >= _cfg.high_day_reservations
-    )
-    zeros_in_window = sum(1 for d in allowed_in_window if counts.get(d, 0) == 0)
+    hash_set = set(consul_hashes)
+    busy = reserved_busy_intervals(raw_slots, hash_set)
+    free_in_grid = possible_slots_not_overlapping_reservations(possible, busy, _cfg.slot_minutes)
+    reserved_count = len(possible) - len(free_in_grid)
+    # Drop same-day (or earlier) slots already in the past; alerts only care about bookable times.
+    now = datetime.now()
+    free_sorted = sorted(s for s in free_in_grid if _slot_starts_at_or_after_now(s, now=now))
 
     meta = {
-        "high_anchor_days_total": bk_meta["anchor_count"],
-        "high_anchor_days_in_window": anchors_in_window,
-        "zero_days_bridged_in_window": zeros_in_window,
-        "bookable_calendar_days_in_window": len(allowed_in_window),
-        "high_day_reservations_threshold": _cfg.high_day_reservations,
-        "max_gap_zero_bridge_days": _cfg.max_gap_zero_bridge_days,
-        "min_zero_days_major_bridge": _cfg.min_zero_days_major_bridge,
-        "portal_wave_cutoff_date": (
-            bk_meta["wave_cutoff"].isoformat() if bk_meta["wave_cutoff"] else None
-        ),
+        "operation_name": _cfg.operation_name,
+        "consul_ipn_hashes": consul_hashes,
+        "calendar_days_in_window": len(allowed_in_window),
+        "reception_weekdays": sorted(wdays),
     }
     return free_sorted, len(free_sorted), reserved_count, today, horizon, meta
 
@@ -536,16 +624,20 @@ def get_free_slots() -> tuple[list[str], int, int, date, date, dict] | None:
 _cfg: Config = Config.from_env()
 _client: ApiClient = ApiClient(_cfg)
 
-# Kept as a module-level variable so `from monitor import INTERVAL` in app.py still works
+# Kept as module-level variables so `from monitor import INTERVAL` in app.py still works
 INTERVAL: int = _cfg.interval
+DRY_RUN: bool = _cfg.dry_run
+OPERATION_NAME: str = _cfg.operation_name
 
 
 def reload_config() -> None:
     """Reload all settings from .env and refresh module singletons."""
-    global _cfg, _client, INTERVAL
+    global _cfg, _client, INTERVAL, DRY_RUN, OPERATION_NAME
     _cfg = Config.from_env()
     _client = ApiClient(_cfg)
     INTERVAL = _cfg.interval
+    DRY_RUN = _cfg.dry_run
+    OPERATION_NAME = _cfg.operation_name
 
 
 def get_last_api_error() -> str | None:
@@ -565,6 +657,7 @@ def get_settings_for_form() -> dict:
         "cookies": _cfg.cookies,
         "interval": _cfg.interval,
         "institution_code": _cfg.institution_code,
+        "operation_name": _cfg.operation_name,
         "consul_ipn_hash": _cfg.consul_ipn_hash,
         "token_configured": bool(file_token) and not file_token.startswith("PASTE_"),
         "env_path": ENV_PATH,
@@ -579,6 +672,7 @@ def save_settings_from_form(
     cookies: str,
     interval: str,
     institution_code: str,
+    operation_name: str,
     consul_ipn_hash: str,
 ) -> tuple[bool, str]:
     """Validate, persist to .env, and hot-reload config. Empty token leaves TOKEN unchanged."""
@@ -594,11 +688,14 @@ def save_settings_from_form(
         return False, "USER_AGENT looks incomplete — paste the full value from DevTools → Network"
 
     inst = (institution_code or "").strip()
+    op = (operation_name or "").strip()
     consul = (consul_ipn_hash or "").strip()
-    if not inst or not consul:
-        return False, "INSTITUTION_CODE and CONSUL_IPN_HASH are required"
-    if re.fullmatch(r"[0-9a-fA-F]{64}", consul) is None:
-        return False, "CONSUL_IPN_HASH must be 64 hex characters"
+    if not inst:
+        return False, "INSTITUTION_CODE is required"
+    if not op:
+        return False, "OPERATION_NAME is required"
+    if consul and re.fullmatch(r"[0-9a-fA-F]{64}", consul) is None:
+        return False, "CONSUL_IPN_HASH must be empty or 64 hex characters"
 
     Path(ENV_PATH).parent.mkdir(parents=True, exist_ok=True)
     if not Path(ENV_PATH).is_file():
@@ -612,6 +709,7 @@ def save_settings_from_form(
     set_key(ENV_PATH, "COOKIES", cookies.strip() if cookies else "", quote_mode="always")
     set_key(ENV_PATH, "INTERVAL", str(iv), quote_mode="always")
     set_key(ENV_PATH, "INSTITUTION_CODE", inst, quote_mode="always")
+    set_key(ENV_PATH, "OPERATION_NAME", op, quote_mode="always")
     set_key(ENV_PATH, "CONSUL_IPN_HASH", consul, quote_mode="always")
 
     reload_config()

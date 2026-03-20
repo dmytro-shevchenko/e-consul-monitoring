@@ -146,8 +146,11 @@ SETTINGS_HTML = """
     <label>INSTITUTION_CODE</label>
     <input type="text" name="institution_code" value="{{ institution_code }}" required>
 
-    <label>CONSUL_IPN_HASH <span class="hint">64 hex chars</span></label>
-    <input type="text" name="consul_ipn_hash" value="{{ consul_ipn_hash }}" required pattern="[0-9a-fA-F]{64}">
+    <label>OPERATION_NAME <span class="hint">exact service name from schedule</span></label>
+    <input type="text" name="operation_name" value="{{ operation_name }}" required>
+
+    <label>CONSUL_IPN_HASH <span class="hint">optional — 64 hex; empty = all consuls offering this operation</span></label>
+    <input type="text" name="consul_ipn_hash" value="{{ consul_ipn_hash }}" placeholder="(optional)" maxlength="64">
 
     <button type="submit">Save to .env</button>
   </form>
@@ -175,6 +178,7 @@ def settings():
             cookies=request.form.get("cookies", ""),
             interval=request.form.get("interval", "300"),
             institution_code=request.form.get("institution_code", ""),
+            operation_name=request.form.get("operation_name", ""),
             consul_ipn_hash=request.form.get("consul_ipn_hash", ""),
         )
         if ok:
@@ -193,6 +197,7 @@ def settings():
         cookies=s["cookies"],
         interval=s["interval"],
         institution_code=s["institution_code"],
+        operation_name=s["operation_name"],
         consul_ipn_hash=s["consul_ipn_hash"],
         token_status=s["token_status"],
     )

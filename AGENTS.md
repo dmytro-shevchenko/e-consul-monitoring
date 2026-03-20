@@ -14,7 +14,8 @@ The system uses the єКонсул (e-Consul) portal. Authentication is handled 
 - API URL: https://my.e-consul.gov.ua/external_reader
 - Method: POST
 - Institution Code (NYC): 1000000514
-- Consul IPN Hash: 90ed02ab516eecbe60b758139ec26d32498df7f83e02d89be5a5ff69afa46e4c
+- Operation (example): `Оформлення закордонного паспорта` — must match `consularInstitutionService[].name` in the schedule response
+- Optional `CONSUL_IPN_HASH`: limit to one consul (e.g. `90ed02ab…`); if unset, all consuls that list the operation are merged
 - Service Type: e-queue-register
 
 ## 🔑 Required Credentials (User Provided)
@@ -26,7 +27,7 @@ a **token** header and **User-Agent**; no Cookie header is present.
 1. **TOKEN**: The JWT sent in the `token` request header (session auth from Diia/ID.GOV.UA).
 2. **USER_AGENT**: Must match the browser used to obtain the token (helps with Cloudflare).
 
-The monitor expands the consul’s weekly schedule from **today** forward over a long fixed horizon in code (slot generation only); the portal still decides which dates are bookable.
+The monitor loads **all** consul blocks from the institution schedule, keeps those whose `consularInstitutionService` includes **OPERATION_NAME** (exact string), merges `receptionCitizensTime` and `nonWorkingTime`, expands weekly hours into **10-minute** slots from **today** through a fixed horizon, subtracts reserved times for the involved consul(s), and treats the remainder as free. The live portal may still hide some dates in the UI.
 
 You can set `TOKEN` and `USER_AGENT` as environment variables (e.g. via `.env`); see `.env.example`. 
 
@@ -38,15 +39,9 @@ the value of the **token** header (long JWT string) and the **User-Agent** heade
 
 1. Availability Check (schedule + reserved slots)
 
-The script expands the consul schedule from **today** forward over a long horizon (recomputed each run); the portal may still restrict which dates are offered for booking.
-
-- Action: (1) `public-calendar-get-actual-consuls-schedule` for working hours; (2) `public-get-consuls-reserved-slots` for taken slots.
-- Logic: Treat days with **many** reservations (≥ ~20) as **anchor** days. 
-  Bridge **zero-reservation** days only between consecutive anchors when the gap is ≤ ~15 calendar days **and** the gap 
-  contains at least **~7** zero days (so weekend-only gaps between busy days are ignored; 
-  real “open” waves like Aug 12→24 with ~10 zeros still bridge). Ignore all bookable days **before** the first such
-  major zero gap (portal wave cutoff). Expand the weekly schedule only on remaining bookable days, then subtract reserved → **free slots**.
-- Alert Trigger: When free slots appear or the free count increases (not by comparing raw reserved counts alone).
+- Action: (1) `public-calendar-get-actual-consuls-schedule` — select blocks listing **OPERATION_NAME**, merge hours + non-working intervals; (2) `public-get-consuls-reserved-slots` with every **consulIpnHash** from those blocks (one request, multiple hashes).
+- Logic: For each calendar day in the forward window whose weekday appears in the merged reception template, emit **10-minute** slots, drop overlaps with `nonWorkingTime`, subtract reserved slot starts → **free slots**.
+- Alert Trigger: When free slots appear or the free count increases.
 
 2. Session Maintenance
 
@@ -78,7 +73,7 @@ payload = {
     "filters": {
         "institutionCode": "1000000514",
         "status": [1, 2, 4, 5],
-        "consulIpnHash": ["90ed02ab516eecbe60b758139ec26d32498df7f83e02d89be5a5ff69afa46e4c"]
+        "consulIpnHash": ["…", "…"]  # all consul hashes that list OPERATION_NAME in the schedule
     }
 }
 ```
@@ -96,3 +91,4 @@ The user must update this file (or env / app config) whenever:
 
 - The token (JWT) has expired (new manual login and copy new token).
 - The institutionCode changes (if checking a different consulate like DC or Chicago).
+- The **OPERATION_NAME** string if monitoring a different service (must match the schedule API exactly).
