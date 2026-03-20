@@ -162,7 +162,6 @@ SETTINGS_HTML = """
       <span class="bad">{{ token_status.issues or 'No expiry info' }}</span>
     {% endif %}
   </div>
-  <p class="hint">Values are stored in <code>{{ env_path }}</code>. Leave <strong>Token</strong> empty to keep the current one.</p>
   {% for c, m in get_flashed_messages(with_categories=true) %}
   <div class="flash {{ 'err' if c == 'error' else 'ok' }}">{{ m }}</div>
   {% endfor %}
@@ -173,26 +172,11 @@ SETTINGS_HTML = """
     <label>USER_AGENT <span class="hint">required</span></label>
     <input type="text" name="user_agent" value="{{ user_agent }}" required>
 
-    <label>COOKIES <span class="hint">optional</span></label>
-    <textarea name="cookies" placeholder="Optional Cookie header value">{{ cookies }}</textarea>
-
     <label>INTERVAL (seconds)</label>
     <input type="number" name="interval" min="60" max="86400" value="{{ interval }}">
 
-    <label>INSTITUTION_CODE</label>
-    <input type="text" name="institution_code" value="{{ institution_code }}" required>
-
     <label>OPERATION_NAME <span class="hint">exact service name from schedule</span></label>
     <input type="text" name="operation_name" value="{{ operation_name }}" required>
-
-    <label>CONSUL_IPN_HASH <span class="hint">optional — 64 hex; empty = all consuls offering this operation</span></label>
-    <input type="text" name="consul_ipn_hash" value="{{ consul_ipn_hash }}" placeholder="(optional)" maxlength="64">
-
-    <label>TELEGRAM_BOT_TOKEN <span class="hint">optional — leave blank when saving other fields to keep existing token</span></label>
-    <input type="password" name="telegram_bot_token" autocomplete="off" placeholder="{% if telegram_bot_token %}•••• (saved){% else %}123456:ABC…{% endif %}">
-
-    <label>TELEGRAM_CHAT_ID <span class="hint">optional — group or user numeric id</span></label>
-    <input type="text" name="telegram_chat_id" value="{{ telegram_chat_id }}" placeholder="-1001234567890">
 
     <button type="submit">Save to .env</button>
   </form>
@@ -298,13 +282,8 @@ def settings():
         ok, msg = save_settings_from_form(
             token=request.form.get("token"),
             user_agent=request.form.get("user_agent", ""),
-            cookies=request.form.get("cookies", ""),
             interval=request.form.get("interval", "300"),
-            institution_code=request.form.get("institution_code", ""),
             operation_name=request.form.get("operation_name", ""),
-            consul_ipn_hash=request.form.get("consul_ipn_hash", ""),
-            telegram_bot_token=request.form.get("telegram_bot_token", ""),
-            telegram_chat_id=request.form.get("telegram_chat_id", ""),
         )
         if ok:
             flash(msg, "success")
@@ -319,13 +298,8 @@ def settings():
         env_path=s["env_path"],
         token_configured=s["token_configured"],
         user_agent=s["user_agent"],
-        cookies=s["cookies"],
         interval=s["interval"],
-        institution_code=s["institution_code"],
         operation_name=s["operation_name"],
-        consul_ipn_hash=s["consul_ipn_hash"],
-        telegram_bot_token=s["telegram_bot_token"],
-        telegram_chat_id=s["telegram_chat_id"],
         token_status=s["token_status"],
         nav_html=nav_html(),
     )

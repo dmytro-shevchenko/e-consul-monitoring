@@ -688,13 +688,8 @@ def get_settings_for_form() -> dict:
     file_token = (dotenv_values(ENV_PATH).get("TOKEN") or "").strip()
     return {
         "user_agent": _cfg.user_agent,
-        "cookies": _cfg.cookies,
         "interval": _cfg.interval,
-        "institution_code": _cfg.institution_code,
         "operation_name": _cfg.operation_name,
-        "consul_ipn_hash": _cfg.consul_ipn_hash,
-        "telegram_bot_token": _cfg.telegram_bot_token,
-        "telegram_chat_id": _cfg.telegram_chat_id,
         "token_configured": bool(file_token) and not file_token.startswith("PASTE_"),
         "env_path": ENV_PATH,
         "token_status": get_token_status(_cfg.token),
@@ -705,15 +700,13 @@ def save_settings_from_form(
     *,
     token: str | None,
     user_agent: str,
-    cookies: str,
     interval: str,
-    institution_code: str,
     operation_name: str,
-    consul_ipn_hash: str,
-    telegram_bot_token: str | None = None,
-    telegram_chat_id: str | None = None,
 ) -> tuple[bool, str]:
-    """Validate, persist to .env, and hot-reload config. Empty token leaves TOKEN unchanged."""
+    """Validate, persist to .env, and hot-reload config. Empty token leaves TOKEN unchanged.
+
+    COOKIES, INSTITUTION_CODE, CONSUL_IPN_HASH, TELEGRAM_* are not written here — edit .env directly.
+    """
     try:
         iv = max(60, min(86400, int((interval or "300").strip() or "300")))
     except ValueError:
@@ -725,15 +718,9 @@ def save_settings_from_form(
     if len(ua) < 40:
         return False, "USER_AGENT looks incomplete — paste the full value from DevTools → Network"
 
-    inst = (institution_code or "").strip()
     op = (operation_name or "").strip()
-    consul = (consul_ipn_hash or "").strip()
-    if not inst:
-        return False, "INSTITUTION_CODE is required"
     if not op:
         return False, "OPERATION_NAME is required"
-    if consul and re.fullmatch(r"[0-9a-fA-F]{64}", consul) is None:
-        return False, "CONSUL_IPN_HASH must be empty or 64 hex characters"
 
     Path(ENV_PATH).parent.mkdir(parents=True, exist_ok=True)
     if not Path(ENV_PATH).is_file():
@@ -744,15 +731,8 @@ def save_settings_from_form(
         set_key(ENV_PATH, "TOKEN", token_stripped, quote_mode="always")
 
     set_key(ENV_PATH, "USER_AGENT", ua, quote_mode="always")
-    set_key(ENV_PATH, "COOKIES", cookies.strip() if cookies else "", quote_mode="always")
     set_key(ENV_PATH, "INTERVAL", str(iv), quote_mode="always")
-    set_key(ENV_PATH, "INSTITUTION_CODE", inst, quote_mode="always")
     set_key(ENV_PATH, "OPERATION_NAME", op, quote_mode="always")
-    set_key(ENV_PATH, "CONSUL_IPN_HASH", consul, quote_mode="always")
-    tg_tok = (telegram_bot_token or "").strip()
-    if tg_tok:
-        set_key(ENV_PATH, "TELEGRAM_BOT_TOKEN", tg_tok, quote_mode="always")
-    set_key(ENV_PATH, "TELEGRAM_CHAT_ID", (telegram_chat_id or "").strip(), quote_mode="always")
 
     reload_config()
     return True, f"Saved to {ENV_PATH}"
