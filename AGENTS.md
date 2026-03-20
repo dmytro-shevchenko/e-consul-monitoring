@@ -46,8 +46,9 @@ the value of the **token** header (long JWT string) and the **User-Agent** heade
 2. Session Maintenance
 
 - Heartbeat: The script must run every 300 seconds (5 minutes).
-- 403 Handling: If the API returns 403 Forbidden, the agent must notify the user that the token (JWT) has expired and request a new login / token update.
-- IP Consistency: The script must run from the same IP address used to log in manually, or Cloudflare will reject the token.
+- **401 vs 403:** HTTP **401** usually means the JWT is rejected/expired. HTTP **403** from `my.e-consul.gov.ua` is often **Cloudflare / WAF** (client IP or fingerprint mismatch), not necessarily an expired token.
+- **IP consistency:** Traffic must use the **same public IP** (and matching **USER_AGENT**) as the browser session where you obtained **TOKEN**, or Cloudflare commonly returns **403** even with a valid JWT.
+- **EKS / cloud:** Pod egress is the cluster **NAT/public IP** (datacenter). If you logged in from home, that IP differs — **403 is expected**. Run the monitor from the same network as login, route egress through it, or use a home/residential host; copying **COOKIES** rarely fixes cross-IP blocks.
 
 3. Notification Payload
 
@@ -82,6 +83,7 @@ payload = {
 
 ## ⚠️ Known Constraints
 
+- **EKS and Cloudflare:** Deploying only the UI/API checker in EKS while logging in from another network usually fails with **403** until egress IP matches the login IP (see IP consistency above).
 - Cloudflare WAF: Do not decrease the polling interval below 3 minutes.
 - Diia Sync: For male applicants 18–60, the portal checks the Reserve+ database. If the user's status is not updated, the API may return 0 slots or an error even with a valid token.
 - Midnight Release: Monitor heavily between 17:00 and 18:00 EST (Midnight Kyiv time), as this is when new daily batches are released.

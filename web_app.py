@@ -93,7 +93,7 @@ INDEX_HTML = """
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
     function refresh() {
-      fetch('/status').then(r => r.json()).then(d => {
+      fetch('/status', { credentials: 'same-origin' }).then(r => r.json()).then(d => {
         const s = document.getElementById('status');
         const run = d.running;
         document.getElementById('btnStart').disabled = run;
@@ -108,14 +108,20 @@ INDEX_HTML = """
           else if (t.issues) validLine = escapeHtml(t.issues);
         }
         html += '<div>Valid for: ' + validLine + '</div>';
+        if (!run) {
+          html += '<div class="error" style="margin-top:0.5rem;">Monitor is stopped — click <strong>Start</strong> to poll the API.</div>';
+        }
+        if (d.last_error) {
+          html += '<div class="error" style="margin-top:0.5rem;">Last error: ' + escapeHtml(d.last_error) + '</div>';
+        }
         html += '<hr class="sep" />';
         const ff = (d.last_result && d.last_result.first_free) ? escapeHtml(d.last_result.first_free) : '—';
         html += '<div>First free: ' + ff + '</div>';
         s.innerHTML = html;
       }).catch(() => { document.getElementById('status').textContent = 'Failed to load status'; });
     }
-    function start() { fetch('/start', { method: 'POST' }).then(() => refresh()); }
-    function stop() { fetch('/stop', { method: 'POST' }).then(() => refresh()); }
+    function start() { fetch('/start', { method: 'POST', credentials: 'same-origin' }).then(() => refresh()); }
+    function stop() { fetch('/stop', { method: 'POST', credentials: 'same-origin' }).then(() => refresh()); }
     refresh();
     setInterval(refresh, 5000);
   </script>
@@ -312,13 +318,17 @@ def status():
 
 @app.route("/start", methods=["POST"])
 def start():
+    print(f"[e-consul] HTTP POST /start pid={os.getpid()}", flush=True)
     ok = get_monitor().start()
+    print(f"[e-consul] HTTP POST /start result started={ok}", flush=True)
     return jsonify({"ok": ok, "message": "Started" if ok else "Already running"})
 
 
 @app.route("/stop", methods=["POST"])
 def stop():
+    print(f"[e-consul] HTTP POST /stop pid={os.getpid()}", flush=True)
     ok = get_monitor().stop()
+    print(f"[e-consul] HTTP POST /stop result stopped={ok}", flush=True)
     return jsonify({"ok": ok, "message": "Stopped" if ok else "Not running"})
 
 

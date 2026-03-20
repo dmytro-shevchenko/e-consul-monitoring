@@ -24,6 +24,9 @@ COPY examples ./examples
 COPY .env.example ./.env.example
 COPY .env ./.env
 
+# So uid 1000 can write .env and python-dotenv temp files next to it (set_key uses NamedTemporaryFile in /app).
+RUN chown -R app:app /app
+
 USER app
 
 EXPOSE 8080

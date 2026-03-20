@@ -48,6 +48,11 @@ def _env_truthy(name: str) -> bool:
     return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _console_debug(msg: str) -> None:
+    """stderr line for kubectl logs / docker logs (gunicorn worker)."""
+    print(f"[e-consul] pid={os.getpid()} {msg}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -70,7 +75,8 @@ class Config:
 
     @classmethod
     def from_env(cls) -> Config:
-        load_dotenv(ENV_PATH, override=True)
+        # Do not override process env (e.g. Kubernetes Secret); .env fills gaps for local runs.
+        load_dotenv(ENV_PATH, override=False)
 
         def _s(key: str, default: str = "") -> str:
             return (os.getenv(key, default) or "").strip().strip("'\"")
@@ -271,10 +277,36 @@ class ApiClient:
             )
         else:
             core = (
-                f"Access denied (HTTP 403) — Cloudflare or session mismatch.{suffix}"
+                f"Access denied (HTTP 403).{suffix}"
                 + (f' Server: "{server_msg}"' if server_msg else "")
+                + " "
+                + self._http403_client_hints(body)
             )
         return f"{method}: {core}"
+
+    def _http403_client_hints(self, response_body: str) -> str:
+        """Explain common 403 causes (Cloudflare vs app) — especially EKS datacenter egress."""
+        parts: list[str] = []
+        low = (response_body or "").lower()
+        if response_body and (
+            "<!doctype" in low or "cloudflare" in low or "cf-ray" in low or "<html" in low[:500]
+        ):
+            parts.append("Body looks like HTML (often a Cloudflare / WAF block), not API JSON.")
+
+        if os.getenv("KUBERNETES_SERVICE_HOST", "").strip():
+            parts.append(
+                "EKS egress uses your cluster/NAT public IP; Cloudflare often requires the same public IP "
+                "and matching USER_AGENT as the browser where you logged in. A valid JWT from home + "
+                "requests from an AWS IP commonly yields 403. Mitigations: run the monitor on the same network "
+                "as login, send egress through that IP (VPN/proxy), or use a residential/home runner; "
+                "optionally try COOKIES from DevTools if your browser had cf_clearance (still IP-bound)."
+            )
+        else:
+            parts.append(
+                "Typical causes: Cloudflare (same public IP as login, USER_AGENT must match browser); "
+                "sometimes COOKIES / cf_clearance from DevTools — still usually tied to that IP."
+            )
+        return " ".join(parts)
 
     def fetch_institution_schedule(self) -> dict | None:
         """Full institution payload: `data` is a list of consul schedule blocks."""
@@ -703,9 +735,12 @@ def save_settings_from_form(
     interval: str,
     operation_name: str,
 ) -> tuple[bool, str]:
-    """Validate, persist to .env, and hot-reload config. Empty token leaves TOKEN unchanged.
+    """Validate, persist to .env when possible, and hot-reload config. Empty token leaves TOKEN unchanged.
 
-    COOKIES, INSTITUTION_CODE, CONSUL_IPN_HASH, TELEGRAM_* are not written here — edit .env directly.
+    On read-only filesystems (typical on EKS), updates apply only to this process via os.environ;
+    persist by editing the Kubernetes Secret and restarting the pod.
+
+    COOKIES, INSTITUTION_CODE, CONSUL_IPN_HASH, TELEGRAM_* are not written here — edit .env / Secret directly.
     """
     try:
         iv = max(60, min(86400, int((interval or "300").strip() or "300")))
@@ -722,20 +757,41 @@ def save_settings_from_form(
     if not op:
         return False, "OPERATION_NAME is required"
 
-    Path(ENV_PATH).parent.mkdir(parents=True, exist_ok=True)
-    if not Path(ENV_PATH).is_file():
-        Path(ENV_PATH).touch()
-
     token_stripped = (token or "").strip()
-    if token_stripped:
-        set_key(ENV_PATH, "TOKEN", token_stripped, quote_mode="always")
 
-    set_key(ENV_PATH, "USER_AGENT", ua, quote_mode="always")
-    set_key(ENV_PATH, "INTERVAL", str(iv), quote_mode="always")
-    set_key(ENV_PATH, "OPERATION_NAME", op, quote_mode="always")
+    def _apply_to_process_env() -> None:
+        """Update live config source when .env cannot be written (e.g. EKS read-only /app)."""
+        if token_stripped:
+            os.environ["TOKEN"] = token_stripped
+        os.environ["USER_AGENT"] = ua
+        os.environ["INTERVAL"] = str(iv)
+        os.environ["OPERATION_NAME"] = op
+
+    file_written = False
+    try:
+        Path(ENV_PATH).parent.mkdir(parents=True, exist_ok=True)
+        if not Path(ENV_PATH).is_file():
+            Path(ENV_PATH).touch()
+        if token_stripped:
+            set_key(ENV_PATH, "TOKEN", token_stripped, quote_mode="always")
+        set_key(ENV_PATH, "USER_AGENT", ua, quote_mode="always")
+        set_key(ENV_PATH, "INTERVAL", str(iv), quote_mode="always")
+        set_key(ENV_PATH, "OPERATION_NAME", op, quote_mode="always")
+        load_dotenv(ENV_PATH, override=True)
+        file_written = True
+    except OSError:
+        # set_key uses NamedTemporaryFile next to .env; /app is often non-writable for uid 1000
+        # or the whole rootfs is read-only on Kubernetes.
+        _apply_to_process_env()
 
     reload_config()
-    return True, f"Saved to {ENV_PATH}"
+    if file_written:
+        return True, f"Saved to {ENV_PATH}"
+    return (
+        True,
+        "Applied for this process only; .env is not writable (e.g. read-only container filesystem). "
+        "Update the Kubernetes Secret and restart the pod to persist.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -756,9 +812,11 @@ class Monitor:
         self._last_free_count: int | None = None
 
     def _run_loop(self) -> None:
+        _console_debug("monitor thread: loop running")
         while not self._stop.is_set():
             checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
+                _console_debug(f"check begin @{checked_at} interval_s={_cfg.interval}")
                 result = get_free_slots()
                 with self._lock:
                     self._last_check_at = checked_at
@@ -798,6 +856,19 @@ class Monitor:
                     self._last_error = str(exc)
                     self._last_result = None
 
+            with self._lock:
+                err = self._last_error
+                lr = self._last_result
+            if err:
+                _console_debug(f"check end: ERROR {err[:400]}")
+            elif lr is not None:
+                _console_debug(
+                    f"check end: ok free={lr['free_count']} reserved={lr['reserved']} "
+                    f"first_free={lr.get('first_free')!r}"
+                )
+            else:
+                _console_debug("check end: no result")
+
             # Wait for the configured interval or until stop is signalled
             self._stop.wait(timeout=_cfg.interval)
 
@@ -808,22 +879,27 @@ class Monitor:
     def start(self) -> bool:
         with self._lock:
             if self._running:
+                _console_debug("Monitor.start: already running (no-op)")
                 return False
             self._running = True
             self._stop.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+        _console_debug(f"Monitor.start: thread started ident={self._thread.ident}")
         return True
 
     def stop(self) -> bool:
         with self._lock:
             if not self._running:
+                _console_debug("Monitor.stop: not running (no-op)")
                 return False
             self._running = False
+        _console_debug("Monitor.stop: signalling thread")
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=_cfg.interval + 5)
             self._thread = None
+        _console_debug("Monitor.stop: thread joined")
         return True
 
     def get_status(self) -> dict:
