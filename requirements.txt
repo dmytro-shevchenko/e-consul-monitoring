@@ -1,3 +1,4 @@
 python-dotenv
 curl_cffi
 flask
+gunicorn
