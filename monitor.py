@@ -184,6 +184,7 @@ class ApiClient:
     def __init__(self, config: Config) -> None:
         self._cfg = config
         self.last_error: str | None = None
+        self.last_http_status: int | None = None
 
     def _load_example_json(self, filename: str) -> dict | None:
         path = EXAMPLES_DIR / filename
@@ -221,6 +222,7 @@ class ApiClient:
 
     def _post(self, method: str, filters: dict) -> dict | None:
         self.last_error = None
+        self.last_http_status = None
         try:
             r = curl_requests.post(
                 API_URL,
@@ -233,6 +235,7 @@ class ApiClient:
             self.last_error = f"{method}: {exc}"
             return None
 
+        self.last_http_status = r.status_code
         if r.status_code != 200:
             body = r.text or ""
             if r.status_code in (401, 403):
@@ -661,6 +664,11 @@ def get_free_slots() -> tuple[list[str], int, int, date, date, dict] | None:
 _cfg: Config = Config.from_env()
 _client: ApiClient = ApiClient(_cfg)
 
+# One-shot Telegram/console alert for HTTP 401 (token rejected / expired). Cleared after a
+# successful slot check or when TOKEN changes (reload_config / Settings save).
+_auth_expiry_alert_lock = threading.Lock()
+_auth_expiry_alert_sent = False
+
 # Kept as module-level variables so `from monitor import INTERVAL` in app.py still works
 INTERVAL: int = _cfg.interval
 DRY_RUN: bool = _cfg.dry_run
@@ -670,15 +678,48 @@ OPERATION_NAME: str = _cfg.operation_name
 def reload_config() -> None:
     """Reload all settings from .env and refresh module singletons."""
     global _cfg, _client, INTERVAL, DRY_RUN, OPERATION_NAME
+    old_token = _cfg.token
     _cfg = Config.from_env()
     _client = ApiClient(_cfg)
     INTERVAL = _cfg.interval
     DRY_RUN = _cfg.dry_run
     OPERATION_NAME = _cfg.operation_name
+    if _cfg.token != old_token:
+        clear_auth_expiry_alert_flag()
 
 
 def get_last_api_error() -> str | None:
     return _client.last_error
+
+
+def get_last_http_status() -> int | None:
+    return _client.last_http_status
+
+
+def clear_auth_expiry_alert_flag() -> None:
+    """Allow the next HTTP 401 to trigger a token-expired alert again (successful auth or new TOKEN)."""
+    global _auth_expiry_alert_sent
+    with _auth_expiry_alert_lock:
+        _auth_expiry_alert_sent = False
+
+
+def maybe_alert_token_auth_failed(http_status: int | None, error_detail: str) -> None:
+    """
+    On HTTP 401, print and Telegram once per outage; repeat only after a successful check or TOKEN change.
+    """
+    if http_status != 401:
+        return
+    global _auth_expiry_alert_sent
+    with _auth_expiry_alert_lock:
+        if _auth_expiry_alert_sent:
+            return
+        _auth_expiry_alert_sent = True
+    msg = (
+        "TOKEN appears EXPIRED. Update TOKEN in Settings\n"
+        f"{error_detail}"
+    )
+    print(f"\n[ALERT] {msg}\n")
+    send_telegram_alert(msg)
 
 
 def send_telegram_alert(message: str) -> None:
@@ -818,14 +859,20 @@ class Monitor:
             try:
                 _console_debug(f"check begin @{checked_at} interval_s={_cfg.interval}")
                 result = get_free_slots()
-                with self._lock:
-                    self._last_check_at = checked_at
-                    self._last_error = None
-                    if result is None:
-                        self._last_error = get_last_api_error() or "API or parse error."
+                if result is None:
+                    err_msg = get_last_api_error() or "API or parse error."
+                    st = get_last_http_status()
+                    with self._lock:
+                        self._last_check_at = checked_at
+                        self._last_error = err_msg
                         self._last_result = None
-                    else:
-                        free_list, free_count, reserved_count, w_start, w_end, meta = result
+                    maybe_alert_token_auth_failed(st, err_msg)
+                else:
+                    clear_auth_expiry_alert_flag()
+                    free_list, free_count, reserved_count, w_start, w_end, meta = result
+                    with self._lock:
+                        self._last_check_at = checked_at
+                        self._last_error = None
                         self._last_result = {
                             "possible": free_count + reserved_count,
                             "reserved": reserved_count,

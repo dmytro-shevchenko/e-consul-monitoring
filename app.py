@@ -8,9 +8,12 @@ from datetime import datetime
 import monitor
 from monitor import (
     BOOKING_LINK,
+    clear_auth_expiry_alert_flag,
     format_slot_display,
     get_free_slots,
     get_last_api_error,
+    get_last_http_status,
+    maybe_alert_token_auth_failed,
     send_telegram_alert,
 )
 
@@ -28,13 +31,19 @@ def main() -> None:
     last_free_count: int | None = None
 
     while True:
+        monitor.reload_config()
         checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             result = get_free_slots()
             if result is None:
                 detail = get_last_api_error()
                 print(f"[{checked_at}] {detail or 'API or parse error (check TOKEN, USER_AGENT in .env)'}")
+                maybe_alert_token_auth_failed(
+                    get_last_http_status(),
+                    detail or "API or parse error (check TOKEN, USER_AGENT in .env)",
+                )
             else:
+                clear_auth_expiry_alert_flag()
                 free_list, free_count, reserved_count, w_start, w_end, meta = result
                 print(
                     f"[{checked_at}] Window {w_start} → {w_end}: "
