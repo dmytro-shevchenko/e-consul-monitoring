@@ -644,9 +644,8 @@ def get_free_slots() -> tuple[list[str], int, int, date, date, dict] | None:
     busy = reserved_busy_intervals(raw_slots, hash_set)
     free_in_grid = possible_slots_not_overlapping_reservations(possible, busy, _cfg.slot_minutes)
     reserved_count = len(possible) - len(free_in_grid)
-    # Drop same-day (or earlier) slots already in the past; alerts only care about bookable times.
-    now = datetime.now()
-    free_sorted = sorted(s for s in free_in_grid if _slot_starts_at_or_after_now(s, now=now))
+    # Ignore all slots for today — only consider slots from tomorrow onwards.
+    free_sorted = sorted(s for s in free_in_grid if (dt := _slot_key_datetime(s)) and dt.date() > today)
 
     meta = {
         "operation_name": _cfg.operation_name,
