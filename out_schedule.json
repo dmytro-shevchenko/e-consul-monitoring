@@ -1,0 +1,33 @@
+{
+  "consulIpnHashes": [
+    "90ed02ab516eecbe60b758139ec26d32498df7f83e02d89be5a5ff69afa46e4c"
+  ],
+  "nonWorkingTime": [],
+  "receptionCitizensTime": [
+    {
+      "workingDays": "понеділок",
+      "workingHoursTo": "12:00",
+      "workingHoursFrom": "09:00"
+    },
+    {
+      "workingDays": "понеділок",
+      "workingHoursTo": "17:00",
+      "workingHoursFrom": "14:00"
+    },
+    {
+      "workingDays": "середа",
+      "workingHoursTo": "12:00",
+      "workingHoursFrom": "09:00"
+    },
+    {
+      "workingDays": "середа",
+      "workingHoursTo": "17:00",
+      "workingHoursFrom": "14:00"
+    },
+    {
+      "workingDays": "четвер",
+      "workingHoursTo": "12:00",
+      "workingHoursFrom": "09:00"
+    }
+  ]
+}

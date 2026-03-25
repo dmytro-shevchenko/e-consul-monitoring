@@ -27,8 +27,8 @@ _BASE_DIR = Path(__file__).parent
 ENV_PATH = str(_BASE_DIR / ".env")
 EXAMPLES_DIR = _BASE_DIR / "examples"
 # Fixed filenames for DRY_RUN (same shape as live API responses)
-DRY_RUN_SCHEDULE_FILE = "response_2.json"
-DRY_RUN_RESERVED_FILE = "response_1.json"
+DRY_RUN_SCHEDULE_FILE = "schedule.json"
+DRY_RUN_RESERVED_FILE = "reserved_slots.json"
 load_dotenv(ENV_PATH)
 
 API_URL = "https://my.e-consul.gov.ua/external_reader"

@@ -1,4 +1,7 @@
-python-dotenv
+#python-dotenv
 curl_cffi
-flask
-gunicorn
+python-dateutil
+#flask
+#gunicorn
+pydantic==2.12.5
+pydantic-settings==2.12.0
